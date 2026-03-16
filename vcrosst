@@ -580,7 +580,7 @@ def convert_loc_to_q_format(loc):
     parts = loc.split('_')
     return f"Q{parts[0]}_Q{parts[1]}"
     
-def get_source_mask(array, lower_lim, sat_lim = 60000, size_lim = 50):
+def get_source_mask(array, lower_lim, sat_lim = 64000, size_lim = 50):
     """
     Generate a binary mask identifying significant sources in a 2D image array.
 
@@ -1509,12 +1509,12 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
 
     if 'q4_q1' not in skip or 'q2_q1' not in skip or 'q3_q1' not in skip:
         final_mask_1 = get_source_mask(q1, 6000)
-        type1_pixels_1 = ((final_mask_1 > 0) * q1) > 60000
+        type1_pixels_1 = ((final_mask_1 > 0) * q1) > 64000
         logger.info(f"{THIS} Mask 1 Created. [{image_file[-16:]}]")
     
     if 'q4_q2' not in skip or 'q3_q2' not in skip or 'q1_q2' not in skip:
         final_mask_2 = get_source_mask(q2, 4000)  
-        type1_pixels_2 = ((final_mask_2 > 0) * q2) > 60000
+        type1_pixels_2 = ((final_mask_2 > 0) * q2) > 64000
         logger.info(f"{THIS} Mask 2 Created. [{image_file[-16:]}]")
    
     
@@ -1602,7 +1602,7 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
 
     mjd_input, other = extract_fits_headers(image_file, logger)
     
-    mjd_mask = (CFs[:, 2] <= mjd_input) & (mjd_input <= CFs[:, 3])
+    mjd_mask = (mjd_input >= CFs[:, 2]) & (mjd_input <= CFs[:, 3])
     mjd_row = np.where(mjd_mask==True)[0][0]
     
     amp = amp_mode(CFs, mjd_row, logger)
@@ -1669,7 +1669,19 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
     
 
     else: 
+        
+        
+        warning_ranges = [
+            (58581.4, 58615.9),
+            (58912.2, 59037.9),
+            (59178.2, 59179.8),
+            (59745.0, 59926.5)
+        ]
 
+        if any(start <= mjd_input <= end for start, end in warning_ranges):
+            print("Warning: you might want to recompute correction coefficients for this night.")
+        
+        
         # Corr 4 with 1
         if 'q4_q1' not in skip and amp in (4, 2):
             image_data[2056:4112, 2101:4202], ct_mask[2056:4112, 2101:4202] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_1, type1_pixels_1, v, plot_flag, q1, q4, logger, shifter_value=0, loc = "4_1", axis=1)
