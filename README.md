@@ -1,8 +1,8 @@
-# vcross
+# vcrosst
 Inter-quadrant Cross-talk Correction
 
 Documentation  
-https://github.com/priyashmistry/vcross/blob/main/Documentation.md
+https://github.com/priyashmistry/vcrosst/blob/main/Documentation.md
 
 # Installation
 
@@ -14,7 +14,7 @@ or if using Anaconda
 
 ### Setup Local bin Directory and Update PATH
 `mkdir -p ~/bin`  
-`chmod +x ~/bin/vcross`  
+`chmod +x ~/bin/vcrosst`  
 `grep -qxF 'export PATH="$HOME/bin:$PATH"' ~/.zshrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.zshrc`  
 `export PATH="$HOME/bin:$PATH"`  
 
@@ -29,7 +29,7 @@ or if using Anaconda
 
 ### Setup Local bin Directory and Update PATH
 `mkdir -p ~/bin`  
-`chmod +x ~/bin/vcross`  
+`chmod +x ~/bin/vcrosst`  
 `grep -qxF 'export PATH="$HOME/bin:$PATH"' ~/.bashrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc`  
 `export PATH="$HOME/bin:$PATH"`  
 
@@ -46,7 +46,7 @@ Create a bin directory in the user profile
 `New-Item -ItemType Directory -Force -Path "$HOME\bin"`
 
 ### Copy your script there
-`Copy-Item .\vcross.py "$HOME\bin\vcross.py"`
+`Copy-Item .\vcrosst.py "$HOME\bin\vcrosst.py"`
 
 ### Add bin to PATH permanently for PowerShell
 `[Environment]::SetEnvironmentVariable("PATH", "$env:USERPROFILE\bin;$env:PATH", "User")`
