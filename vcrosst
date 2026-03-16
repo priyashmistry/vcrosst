@@ -2,7 +2,7 @@
 #!/Users/z5517274/anaconda3/bin/python3
 
 # Setup
-# mkdir -p ~/bin && chmod +x ~/bin/vcross && grep -qxF 'export PATH="$HOME/bin:$PATH"' ~/.bashrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc && export PATH="$HOME/bin:$PATH"
+# mkdir -p ~/bin && chmod +x ~/bin/vcrosst && grep -qxF 'export PATH="$HOME/bin:$PATH"' ~/.bashrc || echo 'export PATH="$HOME/bin:$PATH"' >> ~/.bashrc && export PATH="$HOME/bin:$PATH"
 
 # Setup to use calibration files i.e., mask1_LC_4.fits & mask1_TH_4.fits
 # First set the variable (Local System):
@@ -12,7 +12,7 @@
 
 
 # Then run:
-# vcross [-p] [-l] [-v] [-cal] [--mask1_threshold 6000] [--mask2_threshold 4000] [--qm_qn_cfs [0,None,None,None,None]] [--skip q1_q2,q2_q1,q3_q1,q3_q2,q4_q2,q4_q1] [if -l then path to .txt] [path to *o.fits files or list of *o.fits files]
+# vcrosst [-p] [-l] [-v] [-cal] [--mask1_threshold 6000] [--mask2_threshold 4000] [--qm_qn_cfs [0,None,None,None,None]] [--skip q1_q2,q2_q1,q3_q1,q3_q2,q4_q2,q4_q1] [if -l then path to .txt] [path to *o.fits files or list of *o.fits files]
 
 # --------------------------------------------------- #
 #                 Importing Libraries                 #
@@ -77,10 +77,10 @@ global VERBOSE
 
 
 # --------------------------------------------------- #
-#     vcross: Calibration File Path Configuration     #
+#     vcrosst: Calibration File Path Configuration     #
 # --------------------------------------------------- #
 """
-This module sets up paths for the `vcross` tool (version 1.1), specifically for locating
+This module sets up paths for the `vcrosst` tool (version 1.1), specifically for locating
 calibration files required by the Veloce Data Reduction (VeloceDR) pipeline. It checks for
 an environment variable override and falls back to a default path relative to the script
 location.
@@ -96,7 +96,7 @@ Environment Variables:
     VELOCEDR_CAL_FILES: If set, overrides the default calibration files path.
 """
 # Constants for the tool's name and version
-COMMAND = "vcross"
+COMMAND = "vcrosst"
 VERSION = "1.1"
 
 # Combined identifier for logging or display purposes
@@ -122,10 +122,10 @@ def get_timestamped_log_name():
     Generate a log file name with a timestamp.
 
     Returns:
-        str: A log file name in the format 'vcross_DDMMYYYY_HHMMSS.log'.
+        str: A log file name in the format 'vcrosst_DDMMYYYY_HHMMSS.log'.
     """
     now = datetime.now().strftime("%d%m%Y_%H%M%S")
-    return f"vcross_{now}.log"
+    return f"vcrosst_{now}.log"
 
 def setup_logger(log_file):
     """
