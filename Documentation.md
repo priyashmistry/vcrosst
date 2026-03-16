@@ -36,7 +36,7 @@ Logging is important so that once the code is deployed into a larger data reduct
   This function generates a log file name with a timestamp.
 
   **Returns:**  
-  - A log file name in the format ``vcross_DDMMYYYY_HHMMSS.log``.
+  - A log file name in the format ``vcrosst_DDMMYYYY_HHMMSS.log``.
 
 - **`setup_logger(log_file)`**  
   This function sets up a logger that writes output to both a file and the console. The logger is uniquely identified by the current process ID, making it suitable for use in multiprocessing environments. For clarity, the log format excludes the process name. It takes `log_file` as a string argument—specifying the path to the log file—and returns a configured logger instance.
