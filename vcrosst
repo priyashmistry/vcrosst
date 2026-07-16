@@ -12,7 +12,12 @@
 
 
 # Then run:
-# vcrosst [-p] [-l] [-v] [-cal] [--mask1_threshold 6000] [--mask2_threshold 4000] [--qm_qn_cfs [0,None,None,None,None]] [--skip q1_q2,q2_q1,q3_q1,q3_q2,q4_q2,q4_q1] [if -l then path to .txt] [path to *o.fits files or list of *o.fits files]
+# vcrosst [-p] [-v] [-cal] [-cal_t1_corr <SimTh file(s)>] [--retrain-model]
+#         [--mask1_threshold <value>] [--mask2_threshold <value>]
+#         [--q4_q1_cfs <coefficients>] [--q4_q2_cfs <coefficients>]
+#         [--q3_q2_cfs <coefficients>] [--q3_q1_cfs <coefficients>]
+#         [--q2_q1_cfs <coefficients>] [--q1_q2_cfs <coefficients>]
+#         [--skip <quadrant_pairs>] [-l <file_list.txt> | <*o.fits files> ...]
 
 # --------------------------------------------------- #
 #                 Importing Libraries                 #
@@ -26,11 +31,15 @@ import csv
 import logging
 import logging.handlers
 import os
+import joblib
 import re
 import shutil
 import sys
+import hdbscan
+import traceback
 import tempfile
 import time
+from tqdm import tqdm
 import subprocess
 import stat
 from ast import literal_eval
@@ -53,6 +62,8 @@ from scipy.ndimage import (
     generate_binary_structure,
     label
 )
+from scipy.ndimage import gaussian_filter
+from sklearn.ensemble import RandomForestClassifier
 from scipy.optimize import curve_fit
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
@@ -60,6 +71,13 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.mixture import GaussianMixture
 from statsmodels.nonparametric.smoothers_lowess import lowess
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score
+)
 
 # === Concurrency Imports ===
 import concurrent.futures
@@ -77,10 +95,10 @@ global VERBOSE
 
 
 # --------------------------------------------------- #
-#     vcrosst: Calibration File Path Configuration     #
+#     vcross: Calibration File Path Configuration     #
 # --------------------------------------------------- #
 """
-This module sets up paths for the `vcrosst` tool (version 1.1), specifically for locating
+This module sets up paths for the `vcross` tool (version 1.1), specifically for locating
 calibration files required by the Veloce Data Reduction (VeloceDR) pipeline. It checks for
 an environment variable override and falls back to a default path relative to the script
 location.
@@ -122,10 +140,10 @@ def get_timestamped_log_name():
     Generate a log file name with a timestamp.
 
     Returns:
-        str: A log file name in the format 'vcrosst_DDMMYYYY_HHMMSS.log'.
+        str: A log file name in the format 'vcross_DDMMYYYY_HHMMSS.log'.
     """
     now = datetime.now().strftime("%d%m%Y_%H%M%S")
-    return f"vcrosst_{now}.log"
+    return f"vcross_{now}.log"
 
 def setup_logger(log_file):
     """
@@ -520,7 +538,7 @@ def get_optimal_workers():
     
     return recommended_workers
 
-def process_files_in_batches(files, args, log_dir=None):
+def process_files_in_batches(files, args, logger, log_dir=None):
     """
     Process a list of FITS files in parallel, in batches, using a process pool.
 
@@ -541,7 +559,7 @@ def process_files_in_batches(files, args, log_dir=None):
 
     for i in range(0, len(files), MAX):
         batch = files[i: i + MAX]
-        print(f"{THIS} Processing batch {i // MAX + 1}: {len(batch)} file(s)...")
+        logger.info(f"{THIS} Processing batch {i // MAX + 1}: {len(batch)} file(s)...")
 
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=get_optimal_workers()
@@ -549,12 +567,22 @@ def process_files_in_batches(files, args, log_dir=None):
             futures = [
                 executor.submit(
                     process_file,
-                    args.p, args.l, args.v, args.cal,
-                    args.mask1_threshold, args.mask2_threshold,
-                    args.q4_q1_cfs, args.q4_q2_cfs,
-                    args.q3_q2_cfs, args.q3_q1_cfs,
-                    args.q2_q1_cfs, args.q1_q2_cfs,
-                    args.skip, image_file,
+                    args.p,
+                    args.l,
+                    args.v,
+                    args.cal,
+                    args.mask1_threshold,
+                    args.mask2_threshold,
+                    args.q4_q1_cfs,
+                    args.q4_q2_cfs,
+                    args.q3_q2_cfs,
+                    args.q3_q1_cfs,
+                    args.q2_q1_cfs,
+                    args.q1_q2_cfs,
+                    args.skip,
+                    image_file,
+                    args.cal_t1_corr,
+                    args.retrain_model,
                     temp_log_dir
                 )
                 for image_file in batch
@@ -580,7 +608,7 @@ def convert_loc_to_q_format(loc):
     parts = loc.split('_')
     return f"Q{parts[0]}_Q{parts[1]}"
     
-def get_source_mask(array, lower_lim, sat_lim = 64000, size_lim = 50):
+def get_source_mask(array, lower_lim, sat_lim, size_lim = 50):
     """
     Generate a binary mask identifying significant sources in a 2D image array.
 
@@ -735,44 +763,6 @@ def apply_random_forest_with_bounding_boxes(loc_data, ct, shifter_value, boundin
 
     return ct
 
-def make_correction(ct, loc_data, source, separation_point, m_2, c_2, m_3, c_3, logger):
-    """
-    Applies a correction to the input `array` based on the `source` and `loc_data` arrays.
-    The correction differs depending on whether values in the `array` are above or below the `separation_point`.
-
-    Args:
-        array (np.ndarray): The array to apply the correction to.
-        loc_data (np.ndarray): 2D array containing the locations to be corrected.
-        source (np.ndarray): The source data array used to calculate the correction.
-        separation_point (float): The threshold value to separate Type II and Type III pixels.
-        m_2 (float): The slope for the correction in Type II.
-        c_2 (float): The intercept for the correction in Type II.
-        m_3 (float): The slope for the correction in Type III.
-        c_3 (float): The intercept for the correction in Type III.
-        logger (logging.Logger): The logger instance used for logging errors.
-        
-    Returns:
-        np.ndarray: The corrected array.
-    
-    Raises:
-        ValueError: If the input arrays do not have the same shape.
-    """
-  
-    if not (ct.shape == source.shape == loc_data.shape):
-        error_message = "Input arrays must have the same shape."
-        logger.error(f"{THIS} {error_message}")
-        raise ValueError(error_message)
-    
-    # Calculate the expressions for conditions
-    adjustment_2 = (m_2 * source + c_2) * loc_data
-    adjustment_3 = (m_3 * source + c_3) * loc_data
-
-    # Apply conditions efficiently
-    mask = ct >= separation_point
-    ct[mask] = ct[mask] - adjustment_2[mask] #+ (qn_bg_filled * loc_data)[mask]
-    ct[~mask] = ct[~mask] - adjustment_3[~mask] #+ (qn_bg_filled * loc_data)[~mask]
-    
-    return ct
 
 def linear_fit(x, y, m=None, c=None):
     """
@@ -826,7 +816,7 @@ def linear_fit(x, y, m=None, c=None):
         m_fit = popt[0]
         m_uncertainty = np.sqrt(pcov[0, 0])
         return {'m': m_fit, 'm_uncertainty': m_uncertainty, 'c': c, 'c_uncertainty': 0.0}
-    
+
 def run_linear_fits(X_t2, Y_t2, X_t3, Y_t3, m2=None, c2=None, m3=None, c3=None):
     """
     Perform linear fits for both above and below threshold data, either with fixed or free slope 
@@ -849,316 +839,374 @@ def run_linear_fits(X_t2, Y_t2, X_t3, Y_t3, m2=None, c2=None, m3=None, c3=None):
     Returns
     dict: A dictionary with the fitting results for both Type II and III data.
     """
-    results = {}
+    try:
+        results = {}
 
-    # --- Fit for ABOVE data ---
-    if m2 is not None and c2 is not None:
-        # both m and c fixed
-        y_pred = fully_fixed_model(X_t2, m2, c2)
-        results['t2'] = {
-            'm': m2,
-            'c': c2,
-            'm_uncertainty': 0.0,
-            'c_uncertainty': 0.0,
-            'y_pred': y_pred
-        }
-    else:
-        res = linear_fit(X_t2, Y_t2, m=m2, c=c2)
-        res['y_pred'] = res['m'] * X_t2 + res['c']
-        results['t2'] = res
+        # --- Fit for ABOVE data ---
+        if m2 is not None and c2 is not None:
+            # both m and c fixed
+            y_pred = X_t2 * m2 + c2 #fully_fixed_model(X_t2, m2, c2)
+            results['t2'] = {
+                'm': m2,
+                'c': c2,
+                'm_uncertainty': 0.0,
+                'c_uncertainty': 0.0,
+                'y_pred': y_pred
+            }
+        else:
+            res = linear_fit(X_t2, Y_t2, m=m2, c=c2)
+            res['y_pred'] = res['m'] * X_t2 + res['c']
+            results['t2'] = res
 
-    # --- Fit for BELOW data ---
-    if m3 is not None and c3 is not None:
-        # both m and c fixed
-        y_pred = fully_fixed_model(X_t3, m3, c3)
-        results['t3'] = {
-            'm': m3,
-            'c': c3,
-            'm_uncertainty': 0.0,
-            'c_uncertainty': 0.0,
-            'y_pred': y_pred
-        }
-    else:
-        res = linear_fit(X_t3, Y_t3, m=m3, c=c3)
-        res['y_pred'] = res['m'] * X_t3 + res['c']
-        results['t3'] = res
+        # --- Fit for BELOW data ---
+        if m3 is not None and c3 is not None:
+            # both m and c fixed
+            y_pred = X_t3 * m3 + c3 #fully_fixed_model(X_t3, m3, c3)
+            results['t3'] = {
+                'm': m3,
+                'c': c3,
+                'm_uncertainty': 0.0,
+                'c_uncertainty': 0.0,
+                'y_pred': y_pred
+            }
+        else:
+            res = linear_fit(X_t3, Y_t3, m=m3, c=c3)
+            res['y_pred'] = res['m'] * X_t3 + res['c']
+            results['t3'] = res
+    
+    except Exception as e:
+                logger.error(f"{e}", file=sys.stderr)
     
     return results
     
-def get_correction(image_file, final_mask, type1_pixels, source, ct, shifter_value, m2, c2, m3, c3, plot_flag, v, th_mask, lc_mask, lc_on, logger, loc, axis = None):
+
+def get_correction(image_file, final_mask, shifter_value, m2, c2, m3, c3, v, plot_flag, source, ct, logger, th_mask, lc_mask, lc_on, simth_file, loc, axis = None):
+
+     
     """
-    Perform cross-talk correction on quadrant image data using linear fitting and masking strategies.
+    Applies Type I, Type II and Type III cross-talk corrections to a single
+    quadrant using the supplied calibration coefficients.
 
-    This function identifies different pixel types involved in cross-talk (Type I, II, III), performs 
-    statistical background estimation and subtraction, applies a Gaussian Mixture Model (GMM) for 
-    data separation, and fits two linear models to the cross-talk data. It then applies a two-phase 
-    correction using fitted parameters and a machine learning-based post-correction using bounding boxes.
+    The function first estimates and removes the local background from the
+    cross-talk quadrant before applying linear corrections to Type II and
+    Type III pixels. Type I pixels are then corrected using either the
+    default trend-based method or the calibration-based SimTh method,
+    depending on whether a SimTh frame is provided.
 
-    Args:
-    – image file (str): The path to the FITS image file being processed, used for logging and
-    output file naming.
-    – final mask (np.ndarray): Boolean or binary mask identifying cross-talk-affected pixels.
-    – type1 pixels (np.ndarray): Mask indicating pixels involved in Type I cross-talk.
-    – source (np.ndarray): Source quadrant pixel data.
-    – ct (np.ndarray): Target quadrant pixel data (to be corrected).
-    – shifter value (float): Additional correction shift applied during the final correction
-    step for Type I.
-    – m2, c2 (float): Initial slope and intercept guesses for Type II linear fit.
-    – m3, c3 (float): Initial slope and intercept guesses for Type III linear fit.
-    – plot flag (bool): Whether to generate and save visual plots for diagnostics.
-    – v (bool): Verbosity flag to log additional debugging information.
-    – th mask (np.ndarray): Thorium mask.
-    – lc mask (np.ndarray): Laser comb mask.
-    – lc on (bool): If True, lc mask is used in background estimation.
-    – logger (logging.Logger): Logger object to record progress and results.
-    – loc (str): Quadrant location string indicating correction direction (e.g., ”4 1” means
-    correction in Q4 from Q1).
-    – axis (int, optional): Axis along which flipping and certain operations are performed;
-    default is None.
-    Returns:
-    – ct corrected (np.ndarray): The corrected image data after applying cross-talk correc-
-    tion.
-    – combined mask (np.ndarray): An array indicating pixel types 0 (unaffected), 1 (Type
-    I), and 2 (Type II and III).
+    Parameters
+    ----------
+    image_file : str
+        Path to the FITS image being processed.
+    final_mask : ndarray
+        Pixel classification mask containing the identified cross-talk pixel
+        types.
+    shifter_value : float
+        Offset used by the trend-based Type I correction.
+    m2, c2 : float
+        Initial slope and intercept for the Type II correction model.
+    m3, c3 : float
+        Initial slope and intercept for the Type III correction model.
+    v : bool
+        Enables verbose logging.
+    plot_flag : bool
+        Enables generation of diagnostic plots.
+    source : ndarray
+        Source quadrant responsible for the cross-talk signal.
+    ct : ndarray
+        Cross-talk quadrant to be corrected.
+    logger : logging.Logger
+        Logger used to record processing information.
+    th_mask : ndarray
+        Threshold-based source mask.
+    lc_mask : ndarray
+        Machine-learning source mask.
+    lc_on : bool
+        If True, the machine-learning mask is used together with the threshold
+        mask when estimating the background.
+    simth_file : ndarray or None
+        Mean-combined SimTh image used for calibration-based Type I
+        correction. If None, the default trend-based correction is applied.
+    loc : str
+        Identifier of the quadrant pair being corrected.
+    axis : int, optional
+        Axis used when flipping arrays to align the source and cross-talk
+        quadrants.
+
+    Returns
+    -------
+    ct_corrected : ndarray
+        Cross-talk quadrant after applying all applicable corrections.
+    combined_mask : ndarray
+        Pixel classification mask aligned with the returned corrected
+        quadrant.
 
     Notes
     -----
-    - Applies Gaussian Mixture Model (GMM) clustering to distinguish Type II and Type III pixels.
-    - Fits two separate linear models to each type, storing slope/intercept with uncertainties.
-    - Background estimated using unmasked regions, filled via median imputation.
-    - Results are logged and optionally visualized at various stages.
-    - Final correction is performed in two steps:
-        1. Type II & III correction using linear fits.
-        2. Type I correction using a random forest model.
-
-    Outputs
-    -------
-    - Diagnostic plots for background, correction, and fitting, saved as PNGs if `plot_flag` is True.
-    - Results appended to a CSV file named `Output.csv`.
+    - The local background is estimated from pixels outside the source and
+      cross-talk regions using median imputation.
+    - Type II and Type III corrections are determined by fitting linear
+      models to the corresponding source and cross-talk pixel values.
+    - The fitted coefficients, together with their uncertainties, are logged
+      and appended to the output CSV file.
+    - If ``simth_file`` is provided, Type I correction is performed using the
+      calibration-based SimTh method; otherwise the default trend-based
+      correction is applied.
+    - Diagnostic plots are produced only when ``plot_flag`` is enabled.
     """
+    
+    try:
 
-    # Filter the points where both source and cross-talk are non-zero
-    mask_considered = (final_mask > 0) ^ (type1_pixels > 0)
-    
-    mask1 = type1_pixels
-    mask2 = final_mask ^ mask1
-
-    masked_image1 = source * mask1 # Exterior Region (Type I)
-    masked_image2 = source * mask2 # Type II & Type III
-       
-    # Generate bounding boxes (using the threshold value as needed)
-    threshold = 0  # Adjust the threshold value based on your data
-    binary_data = np.flip(final_mask,axis) != threshold
-    labeled_data, num_features = label(binary_data)
-    slices = find_objects(labeled_data)
-
-    bounding_boxes = []
-    for slice_tuple in slices:
-        if slice_tuple is not None:
-            bbox = [(slice_.start, slice_.stop) for slice_ in slice_tuple]
-            bounding_boxes.append(bbox)
-    
-    mask_considered = masked_image2 != 0
-    
-    ct_mask = np.flip((masked_image1 + masked_image2) > 0, axis)
-    
-    if lc_on:
-        bg_mask = ~(lc_mask | th_mask | ct_mask)
-    
-    else:
-        bg_mask = ~(th_mask | ct_mask)
-    
-    qn_bg = np.where(bg_mask, ct, np.nan)
-    
-    if plot_flag:
-        plt.imshow(qn_bg, vmin = -10, vmax = 10, origin = 'lower')
-        plt.colorbar()
-        plt.grid(False)
-        plt.savefig(str(image_file[-16:])+"_bg_rm_"+str(loc)+".png", dpi=100, format="png", bbox_inches='tight')
-        plt.show()
-            
-    imputer = SimpleImputer(missing_values = np.nan, strategy='median')
-    qn_bg_filled = imputer.fit_transform(qn_bg)
-    
-    if plot_flag:
-        plt.imshow(qn_bg_filled, vmin = -10, vmax = 10, origin = 'lower')
-        plt.colorbar()
-        plt.grid(False)
-        plt.savefig(str(image_file[-16:])+"_bg_"+str(loc)+".png", dpi=100, format="png", bbox_inches='tight')
-        plt.show()
+        t1_mask = (final_mask == 1)
         
-    source_ = np.flip((mask_considered != 0) * source, axis)
-    ct_ = (np.flip((mask_considered != 0), axis) * ct) - (np.flip((mask_considered != 0), axis) * qn_bg_filled)
-    
-    if plot_flag:
-        plt.imshow(ct_, vmin = -10, vmax = 10, origin = 'lower')
-        plt.colorbar()
-        plt.grid(False)
-        plt.savefig(str(image_file[-16:])+"_bg_corr_ct_q_"+str(loc)+".png", dpi=100, format="png", bbox_inches='tight')
-        plt.show()
-   
-    # Flatten the arrays for easy filtering
-    source_flat = source_.flatten()
-    ct_flat = ct_.flatten()
-    
-    ignore_values = 150
-    
-    # Apply the filter: keep only the points where both source and ct are non-zero
-    non_zero_indices = ((source_flat != 0) | (ct_flat != 0)) & (ct_flat <= ignore_values)
-    non_zero_ignored = ((source_flat != 0) | (ct_flat > 0)) & (ct_flat > ignore_values)
-
-    # Assuming source_flat and ct_flat are defined, and non_zero_indices is already known
-    source_data = source_flat[non_zero_indices]
-    ct_data = ct_flat[non_zero_indices]
-
-    # Step 1: Use Gaussian Mixture Model (GMM) to identify clusters in ct_data
-    gmm = GaussianMixture(n_components=2, random_state=42)
-    ct_data_reshaped = ct_data.reshape(-1, 1)
-    gmm.fit(ct_data_reshaped)
-
-    # Get the means of the two clusters
-    cluster_means = np.sort(gmm.means_.flatten())
-
-    # Calculate the separation point as the midpoint between the two cluster means
-    separation_point = np.mean(cluster_means)
-           
-    # Step 2: Split the data into two sets (below and above the separation point)
-    mask_t3 = (ct_data < separation_point)
-    mask_t2 = (ct_data > separation_point)
-    
-    # Type III
-    t3_source = source_data[mask_t3]
-    t3_ct = ct_data[mask_t3]
-    
-    # Type II
-    t2_source = source_data[mask_t2]
-    t2_ct = ct_data[mask_t2]
-    
-    final_results = run_linear_fits(t2_source, t2_ct, t3_source, t3_ct, m2, c2, m3, c3)        
-    
-    m_2 = final_results['t2']['m']
-    m_2e = final_results['t2']['m_uncertainty']
-    c_2 = final_results['t2']['c']
-    c_2e = final_results['t2']['c_uncertainty']
-    y_pred_t2 = final_results['t2']['y_pred']
-    
-    
-    m_3 = final_results['t3']['m']
-    m_3e = final_results['t3']['m_uncertainty']
-    c_3 = final_results['t3']['c']
-    c_3e = final_results['t3']['c_uncertainty']
-    y_pred_t3 = final_results['t3']['y_pred']
-
-    if v or plot_flag:
-
-        # Step 7: Log slope, intercept, and uncertainties for both fits with precision
-
-        if loc == "4_1":
-            logger.info(f"{THIS} Correction in Q4 from Q1. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "4_2":
-            logger.info(f"{THIS} Correction in Q4 from Q2. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "3_1":
-            logger.info(f"{THIS} Correction in Q3 from Q1. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "3_2":
-            logger.info(f"{THIS} Correction in Q3 from Q2. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "2_1":
-            logger.info(f"{THIS} Correction in Q2 from Q1. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "1_2":
-            logger.info(f"{THIS} Correction in Q1 from Q2. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        logger.info(f"{THIS} Linear Fit Results for Type II Pixels: [{image_file[-16:]}]")
-        logger.info(f"{THIS} Slope (m): {m_2:.11f} ± {abs(m_2e):.11f}")
-        logger.info(f"{THIS} Intercept (c): {c_2:.7f} ± {abs(c_2e):.7f}")
-
-        logger.info(f"{THIS} Linear Fit Results for Type III Pixels: [{image_file[-16:]}]")
-        logger.info(f"{THIS} Slope (m): {m_3:.11f} ± {abs(m_3e):.11f}")
-        logger.info(f"{THIS} Intercept (c): {c_3:.7f} ± {abs(c_3e):.7f}")
-
-     
-    if plot_flag:   
-        # Plotting
-        plt.figure(figsize=(12, 8))
-
-        # Plot Set 1 (below separation)
-        plt.scatter(t3_source, t3_ct, color='blue', label='Type III')
-        plt.plot(t3_source, y_pred_t3, color='blue', label=f'Best Fit (Type III): y = {m_3:.6f}x + {c_3:.2f}')
-
-        # Plot Set 2 (above separation)
-        plt.scatter(t2_source, t2_ct, color='red', label='Type II')
-        plt.plot(t2_source, y_pred_t2, color='red', label=f'Best Fit (Type II): y = {m_2:.6f}x + {c_2:.2f}')
-
-        # Plot the points greater than ignored values for context
-        ignored_source = source_flat[non_zero_ignored]
-        ignored_ct = ct_flat[non_zero_ignored]
-        plt.scatter(ignored_source, ignored_ct, color='grey', alpha=0.5, label=f'Points > {ignore_values:.0f}')
+        t2_mask = (final_mask == 2)
+        t3_mask = (final_mask == 3)
         
-        # Labels and title
-        plt.xlabel('Source Pixels')
-        plt.ylabel('Cross-talk Pixels')
-        plt.title('Best Fit Lines and Uncertainty Regions with Automatically Identified Separation [' + image_file[-16:] + ']')
-        plt.legend()
         
-        plt.savefig(str(image_file[-16:])+"_CFs_"+str(loc)+".png", dpi=100, format="png", bbox_inches='tight')
         
-        # Show plot
-        plt.show()
-           
-    csv_file = "Output.csv"
-    
-    # Base headers
-    headers = ["UTMJD", "FILEORIG"]
-    suffixes = ["T1", "T2_M", "T2_ME", "T2_C", "T2_CE", "T3_M", "T3_ME", "T3_C", "T3_CE"]
-    
-    # Define the complete header structure in order
-    headers = ["UTMJD", "FILEORIG"] + [
-    f"{q}_{suffix}" for q in ["Q4_Q1", "Q4_Q2", "Q3_Q1", "Q3_Q2", "Q2_Q1", "Q1_Q2"]
-    for suffix in suffixes]
-    
-    data_values = {
-    f"{convert_loc_to_q_format(loc)}_{suffix}": value 
-    for suffix, value in zip(
-        suffixes,
-        (
-            shifter_value, 
-            m_2,
-            m_2e,
-            c_2, 
-            c_2e,
-            m_3, 
-            m_3e, 
-            c_3, 
-            c_3e
+        ct_mask = np.flip(final_mask > 0, axis)
+
+        if lc_on:
+            bg_mask = ~(lc_mask | th_mask | ct_mask)
+        else:
+            bg_mask = ~(th_mask | ct_mask)
+
+        # Background pixels only
+        qn_bg = np.where(bg_mask, ct, np.nan)
+
+        if plot_flag:
+            plt.imshow(qn_bg, vmin=-10, vmax=10, origin='lower')
+            plt.colorbar()
+            plt.grid(False)
+            plt.savefig(
+                str(image_file[-16:]) + "_bg_rm_" + str(loc) + ".png",
+                dpi=100,
+                format="png",
+                bbox_inches="tight"
+            )
+            plt.show()
+            plt.close()
+
+        # ------------------------------------------------------------------
+        # Fix columns that are entirely NaN before median imputation
+        # ------------------------------------------------------------------
+        all_nan_cols = np.isnan(qn_bg).all(axis=0)
+        qn_bg[:, all_nan_cols] = 0
+
+        imputer = SimpleImputer(
+            missing_values=np.nan,
+            strategy="median"
         )
-    ) 
-}
+
+        qn_bg_filled = imputer.fit_transform(qn_bg)
+
+        if plot_flag:
+            plt.imshow(qn_bg_filled, vmin=-10, vmax=10, origin='lower')
+            plt.colorbar()
+            plt.grid(False)
+            plt.savefig(
+                str(image_file[-16:]) + "_bg_" + str(loc) + ".png",
+                dpi=100,
+                format="png",
+                bbox_inches="tight"
+            )
+            plt.show()
+            plt.close()
+
+        # ------------------------------------------------------------------
+        # Background correction
+        # ------------------------------------------------------------------
+        mask_considered = t2_mask | t3_mask
+
+        source_ = np.flip(mask_considered * source, axis)
+
+        ct_ = (
+            np.flip(mask_considered, axis) * ct
+            - np.flip(mask_considered, axis) * qn_bg_filled
+        )
+
+        if plot_flag:
+            plt.imshow(ct_, vmin=-10, vmax=10, origin='lower')
+            plt.colorbar()
+            plt.grid(False)
+            plt.savefig(
+                str(image_file[-16:]) + "_bg_corr_ct_q_" + str(loc) + ".png",
+                dpi=100,
+                format="png",
+                bbox_inches="tight"
+            )
+            plt.show()
+            plt.close()
+
+
+        t2_source = (source_ * np.flip(t2_mask, axis)).flatten()
+        t2_ct = (ct_ * np.flip(t2_mask, axis)).flatten()
+
+        t3_source = (source_ * np.flip(t3_mask, axis)).flatten()
+        t3_ct = (ct_ * np.flip(t3_mask, axis)).flatten()
+
+        # Keep only pairs where both values are non-zero
+        mask2 = (t2_source != 0) & (t2_ct != 0)
+        mask3 = (t3_source != 0) & (t3_ct != 0)
+
+        t2_source = t2_source[mask2]
+        t2_ct = t2_ct[mask2]
+
+        t3_source = t3_source[mask3]
+        t3_ct = t3_ct[mask3]
+
+        final_results = run_linear_fits(
+            t2_source,
+            t2_ct,
+            t3_source,
+            t3_ct,
+            m2, c2, m3, c3
+        )   
+
+        m_2 = final_results['t2']['m']
+        m_2e = final_results['t2']['m_uncertainty']
+        c_2 = final_results['t2']['c']
+        c_2e = final_results['t2']['c_uncertainty']
+        y_pred_t2 = final_results['t2']['y_pred']
+
+        m_3 = final_results['t3']['m']
+        m_3e = final_results['t3']['m_uncertainty']
+        c_3 = final_results['t3']['c']
+        c_3e = final_results['t3']['c_uncertainty']
+        y_pred_t3 = final_results['t3']['y_pred']
+
+        # -------------------------
+        # Logging
+        # -------------------------
+        if v or plot_flag:
+            try:
+                if loc == "4_1":
+                    logger.info(f"{THIS} Correction in Q4 from Q1. [{image_file[-16:]}]")
+                if loc == "4_2":
+                    logger.info(f"{THIS} Correction in Q4 from Q2. [{image_file[-16:]}]")
+                if loc == "3_1":
+                    logger.info(f"{THIS} Correction in Q3 from Q1. [{image_file[-16:]}]")
+                if loc == "3_2":
+                    logger.info(f"{THIS} Correction in Q3 from Q2. [{image_file[-16:]}]")
+                if loc == "2_1":
+                    logger.info(f"{THIS} Correction in Q2 from Q1. [{image_file[-16:]}]")
+                if loc == "1_2":
+                    logger.info(f"{THIS} Correction in Q1 from Q2. [{image_file[-16:]}]")
+
+                logger.info(f"{THIS} Type II Fit:")
+                logger.info(f"{THIS} Slope (m): {m_2:.11f} ± {abs(m_2e):.11f}")
+                logger.info(f"{THIS} Intercept (c): {c_2:.7f} ± {abs(c_2e):.7f}")
+
+                logger.info(f"{THIS} Type III Fit:")
+                logger.info(f"{THIS} Slope (m): {m_3:.11f} ± {abs(m_3e):.11f}")
+                logger.info(f"{THIS} Intercept (c): {c_3:.7f} ± {abs(c_3e):.7f}")
+
+            except Exception as e:
+                logger.error(f"{THIS}{e}", file=sys.stderr)
+
+        # -------------------------
+        # Plotting
+        # -------------------------
+        if plot_flag:
+
+            try:
+                plt.figure(figsize=(12, 8))
+                
+                plt.scatter(t2_source, t2_ct, color='red', label='Type II', alpha = 0.5, s = 4)
+                plt.plot(t2_source, y_pred_t2, color='red',
+                         label=f'Type II Fit: y = {m_2:.6f}x + {c_2:.2f}')
+                
+                plt.scatter(t3_source, t3_ct, color='blue', label='Type III', alpha = 0.5, s = 4)
+                plt.plot(t3_source, y_pred_t3, color='blue',
+                         label=f'Type III Fit: y = {m_3:.6f}x + {c_3:.2f}')
+
+                plt.grid(True)
+                
+                plt.xlabel('Source Pixels')
+                plt.ylabel('Cross-talk Pixels')
+                plt.title(f'Fit with GMM Separation [{image_file[-16:]}]')
+                #plt.legend()
+
+                plt.savefig(f"{image_file[-16:]}_CFs_{loc}.png",
+                            dpi=100, format="png", bbox_inches='tight')
+
+                plt.show()
+                plt.close()
+
+            except Exception as e:
+                logger.error(f"{THIS}{e}", file=sys.stderr)
+        
+        csv_file = "Output.csv"
+    
+        # Base headers
+        headers = ["UTMJD", "FILEORIG"]
+        suffixes = ["T1", "T2_M", "T2_ME", "T2_C", "T2_CE", "T3_M", "T3_ME", "T3_C", "T3_CE"]
+
+        # Define the complete header structure in order
+        headers = ["UTMJD", "FILEORIG"] + [
+        f"{q}_{suffix}" for q in ["Q4_Q1", "Q4_Q2", "Q3_Q1", "Q3_Q2", "Q2_Q1", "Q1_Q2"]
+        for suffix in suffixes]
+
+        data_values = {
+        f"{convert_loc_to_q_format(loc)}_{suffix}": value 
+        for suffix, value in zip(
+            suffixes,
+            (
+                shifter_value, 
+                m_2,
+                m_2e,
+                c_2, 
+                c_2e,
+                m_3, 
+                m_3e, 
+                c_3, 
+                c_3e
+                    )
+                ) 
+            }
+
+        write_to_csv(image_file, loc, data_values, suffixes, csv_file, headers, logger)
+        
+        ny, nx = source.shape
+
+        corr_array = np.zeros((ny, nx), dtype=np.int16)
+
+        corr_array[np.where(t2_mask)] = source[np.where(t2_mask)] * m_2 + c_2
+        corr_array[np.where(t3_mask)] = source[np.where(t3_mask)] * m_3 + c_3
+        
+        ct_corrected_23 = ct - np.flip(corr_array,axis)
+        
+        if simth_file is not None:
+            ct_corrected = simth_t1_corr(image_file, ct_corrected_23, simth_file, np.flip(t1_mask, axis), (final_mask != 0), th_mask, lc_mask, lc_on, logger, loc, plot_flag, axis)
+            
+        else:
+            
+            # Generate bounding boxes (using the threshold value as needed)
+            threshold = 0  # Adjust the threshold value based on your data
+            binary_data = np.flip(final_mask,axis) != threshold
+            labeled_data, num_features = label(binary_data)
+            slices = find_objects(labeled_data)
+
+            bounding_boxes = []
+            for slice_tuple in slices:
+                if slice_tuple is not None:
+                    bbox = [(slice_.start, slice_.stop) for slice_ in slice_tuple]
+                    bounding_boxes.append(bbox)
+
+            corr_1 = ct_corrected_23.copy()
+            loc_data = (np.flip(t1_mask, axis) > 0) * ct
+            
+            ct_corrected = apply_random_forest_with_bounding_boxes(loc_data, corr_1, shifter_value, bounding_boxes=bounding_boxes)
   
-    write_to_csv(image_file, loc, data_values, suffixes, csv_file, headers, logger)
-    
-    # Initialize combined mask with zeros
-    combined_mask = np.zeros_like(ct, dtype=np.uint8)
-    
-    # Process for correction using bounding boxes
-    loc_data = (np.flip(masked_image2, axis) > 0)
-    combined_mask[loc_data] = 2
-    ct_corrected = make_correction(ct, loc_data, np.flip(source,axis), separation_point, m_2, c_2, m_3, c_3, logger)
-    
-    corr_1 = ct_corrected.copy()
-    loc_data = (np.flip(masked_image1, axis) > 0) * ct
-    combined_mask[loc_data > 0] = 1
-    ct_corrected = apply_random_forest_with_bounding_boxes(loc_data, corr_1, shifter_value, bounding_boxes=bounding_boxes)
+        
+        combined_mask = np.flip(final_mask,axis)
+ 
+    except Exception as e:
+                logger.error(f"{e}", file=sys.stderr)
     
     return ct_corrected, combined_mask
+
+
+
 
 def amp_mode(CFs, mjd_row, logger):
     """
@@ -1269,255 +1317,1194 @@ def get_data_for_location(CFs, mjd_row, loc, logger):
     # Return the values; you can also return a dictionary if that suits your application.
     return m_2, m_2e, c_2, c_2e, m_3, m_3e, c_3, c_3e
 
-def correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask, type1_pixels, v, plot_flag, source, ct, logger, shifter_value, loc, axis = None):
-    """
-    Perform a correction to the image using known calibration factors (CFs) for a given location.
 
-    This function performs a series of corrections on an image array based on calibration factors,
-    applying a Gaussian Mixture Model (GMM) to identify and separate clusters in the data. The
-    function uses known CFs (m2, m2e, c2, c2e, m3, m3e, c3, c3e) to apply corrections for Type II and
-    Type III pixels, and adjusts the array using a Random Forest model for bounding boxes in the image.
+def find_tight_squares(mask):
+    labeled_mask, num_features = label(mask)
+    tight_squares = []
+
+    for i in range(1, num_features + 1):
+        region_mask = (labeled_mask == i)
+        rows, cols = np.nonzero(region_mask)
+        min_row, max_row = rows.min(), rows.max()
+        min_col, max_col = cols.min(), cols.max()
+
+        # Create a tight square around the region
+        tight_square_mask = region_mask[min_row:max_row + 1, min_col:max_col + 1]
+        tight_squares.append((tight_square_mask, min_row, max_row, min_col, max_col))
+
+    return tight_squares
+
+def remove_small_groups_in_tight_squares(fits_image, tight_squares, min_size=15):
+    unnecessary_pixels = np.zeros_like(fits_image, dtype=bool)
+
+    for tight_square_mask, min_row, max_row, min_col, max_col in tight_squares:
+        # Scan the tight square from left to right up to 5 columns or the width of the square
+        for col_offset in range(min(12, max_col - min_col + 1)):
+            col_start = min_col + col_offset
+            col_mask = tight_square_mask[:, col_offset]  # Extract the column mask
+            
+            if np.any(col_mask):  # Ensure there are non-zero pixels in the column mask
+                _, removed_mask = remove_small_groups_with_mask(col_mask, min_size=min_size)
+                unnecessary_pixels[min_row:max_row + 1, col_start] |= removed_mask
+
+    return unnecessary_pixels
+
+def remove_small_groups_with_mask(arr, min_size):
+    """
+    Remove groups of contiguous pixels in each column that are smaller than a specified size and create a mask of removed pixels.
 
     Parameters:
+    arr (ndarray): Input 1-dimensional array (column mask).
+    min_size (int): Minimum size of a group of pixels to keep.
+
+    Returns:
+    tuple: (ndarray, ndarray) - Array with small groups removed and mask of removed pixels.
+    """
+    # Create a copy of the array to avoid modifying the original one
+    result = arr.copy()
+
+    # Create a mask to keep track of removed pixels
+    removed_mask = np.zeros_like(arr, dtype=bool)
+
+    # Label contiguous groups of non-zero pixels
+    labeled_array, num_features = label(arr)
+
+    for group_label in range(1, num_features + 1):
+        # Find the indices of the current group
+        group_indices = np.where(labeled_array == group_label)[0]
+
+        # Check the size of the group
+        if len(group_indices) < min_size:
+            # Remove the group (set it to zero) and update the mask
+            result[group_indices] = 0
+            removed_mask[group_indices] = True
+
+    return result, removed_mask
+
+
+def simth_t1_corr(image_file, ct, simth_file, type_1_mask, full_mask,
+                  th_mask, lc_mask, lc_on, logger, loc, plot_flag, axis=None):
+    
+    
+    """
+    Performs calibration-based Type I cross-talk correction using a SimTh frame.
+
+    The function estimates the Type I cross-talk signal by removing the
+    background from a mean-combined SimTh image. The extracted Type I signal
+    is then subtracted from the cross-talk quadrant only at pixels identified
+    as Type I.
+
+    Parameters
+    ----------
     image_file : str
-        The file path of the image being processed.
-        
-    mjd_input : int
-        The Modified Julian Date (MJD) input that corresponds to the calibration row.
-        
-    CFs : np.ndarray
-        A 2D array of calibration factors. Each row corresponds to a particular MJD, and each column
-        contains a specific calibration parameter (e.g., slope, intercept, and their uncertainties).
-        
-    mjd_row : int
-        The row index corresponding to the MJD for which the calibration factors are applied.
-        
-    final_mask : np.ndarray
-        A mask array of the image indicating the areas to be considered for correction.
-        
-    type1_pixels : np.ndarray
-        A binary mask for Type I pixels.
-        
-    v : bool
-        Flag indicating whether to log verbose information for debugging or reporting.
-        
-    source : np.ndarray
-        The source image or data to be used in the correction.
-        
-    array : np.ndarray
-        The image array to be corrected.
-        
+        Path to the FITS image being processed.
+    ct : ndarray
+        Cross-talk quadrant to be corrected.
+    simth_file : ndarray
+        Mean-combined SimTh image used to estimate the Type I cross-talk
+        signal.
+    type_1_mask : ndarray
+        Binary mask identifying Type I cross-talk pixels.
+    full_mask : ndarray
+        Complete source mask used to identify cross-talk regions.
+    th_mask : ndarray
+        Threshold-based source mask.
+    lc_mask : ndarray
+        Machine-learning source mask.
+    lc_on : bool
+        If True, both the machine-learning and threshold masks are used to
+        identify background pixels. Otherwise only the threshold mask is used.
     logger : logging.Logger
-        A logger object used to log information, warnings, or errors.
-        
-    shifter_value : float
-        A value used for shifting the results, potentially to align with specific corrections or shifts.
-        
+        Logger used to record processing information and errors.
     loc : str
-        A string representing the location key, which corresponds to a specific calibration factor set.
-        
+        Identifier of the quadrant pair being corrected.
+    plot_flag : bool
+        If True, diagnostic images of the background estimation and extracted
+        Type I signal are generated.
     axis : int, optional
-        The axis along which the image is flipped (default is None, meaning no axis flipping).
+        Axis used when flipping the source mask to align it with the
+        cross-talk quadrant.
 
     Returns
     -------
-    array_corrected : np.ndarray
-        The corrected image data after applying cross-talk suppression.
-    combined_mask : np.ndarray
-        An array indicating pixel types:
-            - 0: Unaffected
-            - 1: Type I
-            - 2: Type II & III
+    ndarray
+        Cross-talk quadrant after applying the calibration-based Type I
+        correction.
 
-    Example:
-    >>> correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask, type1_pixels, v=True, source=source_array, array=image_array, logger=my_logger, shifter_value=1.5, loc='4_1')
-    (corrected_image_array, combined_mask)
+    Raises
+    ------
+    Exception
+        Re-raises any exception encountered after logging the full error
+        message and traceback.
 
-    Notes:
-    - The correction process involves several steps: applying a Gaussian Mixture Model to the data to identify clusters,
-      and using pre-calculated slopes and intercepts to apply corrections based on the location.
-    - Bounding boxes are generated to fine-tune corrections using a Random Forest model.
+    Notes
+    -----
+    - Background pixels are identified by excluding source and cross-talk
+      regions from the SimTh image.
+    - Missing background pixels are filled using median imputation before the
+      Type I signal is extracted.
+    - The extracted Type I signal is applied only to pixels identified by
+      ``type_1_mask``.
+    - Diagnostic plots are produced only when ``plot_flag`` is enabled.
+    """
+    
+    
+    try:
+        ct_mask = np.flip(full_mask, axis)
+
+        if lc_on:
+            bg_mask = ~(lc_mask | th_mask | ct_mask)
+        else:
+            bg_mask = ~(th_mask | ct_mask)
+
+        qn_bg = np.where(bg_mask, simth_file, np.nan)
+
+        if plot_flag:
+            plt.imshow(qn_bg, vmin=-10, vmax=10, origin='lower')
+            plt.colorbar()
+            plt.grid(False)
+            plt.savefig(
+                str(image_file[-16:]) + "_bg_rm_" + str(loc) + ".png",
+                dpi=100,
+                format="png",
+                bbox_inches='tight'
+            )
+            plt.show()
+            plt.close()
+    
+        #imputer = SimpleImputer(missing_values=np.nan, strategy='median') 
+        #qn_bg_filled = imputer.fit_transform(qn_bg)
+         
+        # Find columns that are entirely NaN
+        all_nan_cols = np.isnan(qn_bg).all(axis=0)
+
+        # Fill those columns with a value (e.g. 0)
+        qn_bg[:, all_nan_cols] = 0
+
+        # Then run median imputation on the remaining missing values
+        imputer = SimpleImputer(
+            missing_values=np.nan,
+            strategy='median'
+        )
+
+        qn_bg_filled = imputer.fit_transform(qn_bg)
+
+        if plot_flag:
+            plt.imshow(qn_bg_filled, vmin=-10, vmax=10, origin='lower')
+            plt.colorbar()
+            plt.grid(False)
+            plt.savefig(
+                str(image_file[-16:]) + "_bg_" + str(loc) + ".png",
+                dpi=100,
+                format="png",
+                bbox_inches='tight'
+            )
+            plt.show()
+            plt.close()
+            
+        t1_extract = simth_file - qn_bg_filled        
+       
+        if plot_flag:
+            plt.imshow(t1_extract, vmin=-10, vmax=10, origin='lower')
+            plt.colorbar()
+            plt.grid(False)
+            plt.savefig(
+            str(image_file[-16:]) + "_bg_sub_" + str(loc) + ".png",
+            dpi=100,
+            format="png",
+            bbox_inches='tight'
+            )
+            plt.show()
+            plt.close() 
+        
+        t1_corr = ct - (t1_extract * type_1_mask)
+
+        return t1_corr
+
+    except Exception as e:
+        error_msg = (
+            f"Error in simth_t1_corr | "
+            f"image={image_file}, loc={loc}\n"
+            f"Error: {str(e)}\n"
+            f"{traceback.format_exc()}"
+        )
+
+        logger.error(error_msg)
+
+        # Re-raise so the calling code knows it failed
+        raise
+
+
+def correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask, v, plot_flag, source, ct, logger, th_mask, lc_mask, lc_on, simth_file, shifter_value, loc, axis = None):
+
+     
+    """
+    Applies inter-quadrant cross-talk correction using pre-determined calibration coefficients.
+
+    The function corrects cross-talk pixels by applying the appropriate correction model for the specified quadrant pair. Type I pixels are corrected using either the default trend-based method or a calibration-based method when a SimTh frame is provided. 
+    
+    Type II and Type III pixels are corrected using the supplied calibration coefficients.
+
+    Parameters
+    ----------
+    image_file : str
+        Path to the FITS image being processed.
+    mjd_input : int or float
+        Modified Julian Date (MJD) of the observation.
+    CFs : ndarray
+        Array containing the calibration coefficients for all supported
+        MJD ranges.
+    mjd_row : int
+        Index of the row in ``CFs`` corresponding to the selected MJD.
+    final_mask : ndarray
+        Pixel classification mask identifying the cross-talk pixel types.
+    v : bool
+        Enables verbose logging.
+    plot_flag : bool
+        Enables diagnostic plots.
+    source : ndarray
+        Source quadrant contributing the cross-talk signal.
+    ct : ndarray
+        Cross-talk quadrant to be corrected.
+    logger : logging.Logger
+        Logger used to record processing information.
+    th_mask : ndarray
+        Threshold-based mask identifying saturated source pixels.
+    lc_mask : ndarray
+        Machine-learning source mask.
+    lc_on : bool
+        If True, uses the machine-learning mask; otherwise only the
+        threshold mask is used.
+    simth_file : ndarray or None
+        Mean-combined SimTh image used for calibration-based Type I
+        correction. If None, the trend-based correction is applied.
+    shifter_value : float
+        Offset applied to the correction model where required.
+    loc : str
+        Identifier of the quadrant pair being corrected (e.g. ``"q4_q1"``).
+    axis : int, optional
+        Axis along which the arrays are flipped before or after correction,
+        depending on the quadrant orientation.
+
+    Returns
+    -------
+    ndarray
+        The corrected cross-talk quadrant.
     """
 
-    mask_considered = (final_mask > 0) ^ (type1_pixels > 0)
-    
-    mask1 = type1_pixels
-    mask2 = final_mask ^ mask1
+    try:
+        
+        results = get_data_for_location(CFs, mjd_row, loc, logger) 
+        m_2, m_2e, c_2, c_2e, m_3, m_3e, c_3, c_3e = results
 
-    # Generate bounding boxes (using the threshold value as needed)
-    threshold = 0  # Adjust the threshold value based on your data
-    binary_data = np.flip(final_mask,axis) != threshold
-    labeled_data, num_features = label(binary_data)
-    slices = find_objects(labeled_data)
+        t1_mask = (final_mask == 1)
+        
+        t2_mask = (final_mask == 2)
+        t3_mask = (final_mask == 3)
+        
+        #t2_source = source * t2_mask
+        #t3_source = source * t3_mask
+        
+        #t2_ct = np.flip(ct,axis) * t2_mask
+        #t3_ct = np.flip(ct,axis) * t3_mask
+        
+        
+        t2_source = (source * t2_mask).ravel()
+        t2_ct = (np.flip(ct, axis) * t2_mask).ravel()
 
-    bounding_boxes = []
-    for slice_tuple in slices:
-        if slice_tuple is not None:
-            bbox = [(slice_.start, slice_.stop) for slice_ in slice_tuple]
-            bounding_boxes.append(bbox)
+        mask = (t2_source != 0) & (t2_ct != 0)
+
+        t2_source = t2_source[mask]
+        t2_ct = t2_ct[mask]
+
+
+        t3_source = (source * t3_mask).ravel()
+        t3_ct = (np.flip(ct, axis) * t3_mask).ravel()
+
+        mask = (t3_source != 0) & (t3_ct != 0)
+
+        t3_source = t3_source[mask]
+        t3_ct = t3_ct[mask]
+        
+        
+        # -------------------------
+        # Fits
+        # -------------------------
+        y_pred_t3 = m_3 * t3_source + c_3
+        y_pred_t2 = m_2 * t2_source + c_2
+
+        # -------------------------
+        # Logging
+        # -------------------------
+        if v or plot_flag:
+            try:
+                if loc == "4_1":
+                    logger.info(f"{THIS} Correction in Q4 from Q1. [{image_file[-16:]}]")
+                if loc == "4_2":
+                    logger.info(f"{THIS} Correction in Q4 from Q2. [{image_file[-16:]}]")
+                if loc == "3_1":
+                    logger.info(f"{THIS} Correction in Q3 from Q1. [{image_file[-16:]}]")
+                if loc == "3_2":
+                    logger.info(f"{THIS} Correction in Q3 from Q2. [{image_file[-16:]}]")
+                if loc == "2_1":
+                    logger.info(f"{THIS} Correction in Q2 from Q1. [{image_file[-16:]}]")
+                if loc == "1_2":
+                    logger.info(f"{THIS} Correction in Q1 from Q2. [{image_file[-16:]}]")
+
+                logger.info(f"{THIS} Type II Fit:")
+                logger.info(f"{THIS} Slope (m): {m_2:.11f} ± {abs(m_2e):.11f}")
+                logger.info(f"{THIS} Intercept (c): {c_2:.7f} ± {abs(c_2e):.7f}")
+
+                logger.info(f"{THIS} Type III Fit:")
+                logger.info(f"{THIS} Slope (m): {m_3:.11f} ± {abs(m_3e):.11f}")
+                logger.info(f"{THIS} Intercept (c): {c_3:.7f} ± {abs(c_3e):.7f}")
+
+            except Exception as e:
+                logger.error(f"{THIS}{e}", file=sys.stderr)
+
+        # -------------------------
+        # Plotting
+        # -------------------------
+        if plot_flag:
+
+            try:
+                plt.figure(figsize=(12, 8))
+                
+                plt.scatter(t2_source, t2_ct, color='red', label='Type II', alpha = 0.6)
+                plt.plot(t2_source, y_pred_t2, color='red',
+                         label=f'Best Fit (Type II): y = {m_2:.6f}x + {c_2:.2f}')
+                
+                plt.scatter(t3_source, t3_ct, color='blue', label='Type III', alpha = 0.6)
+                plt.plot(t3_source, y_pred_t3, color='blue',
+                         label=f'Best Fit (Type III): y = {m_3:.6f}x + {c_3:.2f}')
+
+                plt.grid(True)
+                
+                plt.xlabel('Source Pixels')
+                plt.ylabel('Cross-talk Pixels')
+                #plt.title(f'Fit with GMM Separation [{image_file[-16:]}]')
+                plt.legend()
+
+                plt.savefig(f"{image_file[-16:]}_CFs_{loc}.png",
+                            dpi=100, format="png", bbox_inches='tight')
+
+                plt.show()
+                plt.close()
+
+            except Exception as e:
+                logger.error(f"{THIS}{e}", file=sys.stderr)
+        
+        ny, nx = source.shape
+
+        corr_array = np.zeros((ny, nx), dtype=np.int16)
+
+        corr_array[np.where(t2_mask)] = source[np.where(t2_mask)] * m_2 + c_2
+        corr_array[np.where(t3_mask)] = source[np.where(t3_mask)] * m_3 + c_3
+        
+        ct_corrected_23 = ct - np.flip(corr_array,axis)
+        
+        if simth_file is not None:
+            ct_corrected = simth_t1_corr(image_file, ct_corrected_23, simth_file, np.flip(t1_mask, axis), (final_mask != 0), th_mask, lc_mask, lc_on, logger, loc, plot_flag, axis)
+            
+        else:
+            
+            # Generate bounding boxes (using the threshold value as needed)
+            threshold = 0  # Adjust the threshold value based on your data
+            binary_data = np.flip(final_mask,axis) != threshold
+            labeled_data, num_features = label(binary_data)
+            slices = find_objects(labeled_data)
+
+            bounding_boxes = []
+            for slice_tuple in slices:
+                if slice_tuple is not None:
+                    bbox = [(slice_.start, slice_.stop) for slice_ in slice_tuple]
+                    bounding_boxes.append(bbox)
+
+            corr_1 = ct_corrected_23.copy()
+            loc_data = (np.flip(t1_mask, axis) > 0) * ct
+            
+            ct_corrected = apply_random_forest_with_bounding_boxes(loc_data, corr_1, shifter_value, bounding_boxes=bounding_boxes)
+  
+        
+        combined_mask = np.flip(final_mask,axis)
  
-    # Flatten the arrays for easy filtering
-    source_flat = (mask1*source).flatten()    
-    ct_flat = ((np.flip(mask2, axis) != 0)*ct).flatten()
+    except Exception as e:
+                logger.error(f"{e}", file=sys.stderr)
     
-    ignore_values = 150
-    # Apply the filter: keep only the points where both source and ct are non-zero
-    non_zero_indices = ((source_flat != 0) | (ct_flat != 0)) & (ct_flat <= ignore_values)
-    non_zero_ignored = ((source_flat != 0) | (ct_flat > 0)) & (ct_flat > ignore_values)
-
-    # Assuming source_flat and ct_flat are defined, and non_zero_indices is already known
-    source_data = source_flat[non_zero_indices]
-    ct_data = ct_flat[non_zero_indices]
-
-    # Step 1: Use Gaussian Mixture Model (GMM) to identify clusters in ct_data
-    gmm = GaussianMixture(n_components=2, random_state=42)
-    ct_data_reshaped = ct_data.reshape(-1, 1)
-    gmm.fit(ct_data_reshaped)
-
-    # Get the means of the two clusters
-    cluster_means = np.sort(gmm.means_.flatten())
-
-    # Calculate the separation point as the midpoint between the two cluster means
-    separation_point = np.mean(cluster_means)
-    
-    results = get_data_for_location(CFs, mjd_row, loc, logger)
-    m_2, m_2e, c_2, c_2e, m_3, m_3e, c_3, c_3e = results
-
-    if v or plot_flag:
-
-        # Step 7: Log slope, intercept, and uncertainties for both fits with precision
-
-        if loc == "4_1":
-            logger.info(f"{THIS} Correction in Q4 from Q1. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "4_2":
-            logger.info(f"{THIS} Correction in Q4 from Q2. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "3_1":
-            logger.info(f"{THIS} Correction in Q3 from Q1. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "3_2":
-            logger.info(f"{THIS} Correction in Q3 from Q2. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "2_1":
-            logger.info(f"{THIS} Correction in Q2 from Q1. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        if loc == "1_2":
-            logger.info(f"{THIS} Correction in Q1 from Q2. [{image_file[-16:]}]")
-            logger.info(f"{THIS} Identified Separation Point: {separation_point:.2f}")
-
-        logger.info(f"{THIS} Linear Fit Results for Type II Pixels: [{image_file[-16:]}]")
-        logger.info(f"{THIS} Slope (m): {m_2:.11f} ± {abs(m_2e):.11f}")
-        logger.info(f"{THIS} Intercept (c): {c_2:.7f} ± {abs(c_2e):.7f}")
-
-        logger.info(f"{THIS} Linear Fit Results for Type III Pixels: [{image_file[-16:]}]")
-        logger.info(f"{THIS} Slope (m): {m_3:.11f} ± {abs(m_3e):.11f}")
-        logger.info(f"{THIS} Intercept (c): {c_3:.7f} ± {abs(c_3e):.7f}")
-    
-    masked_image1 = source * mask1 # Exterior Region (Type I)
-    masked_image2 = source * mask2 # Type II & Type III
-    
-    # Initialize combined mask with zeros
-    combined_mask = np.zeros_like(ct, dtype=np.uint8)
-    
-    loc_data = (np.flip(masked_image2, axis) > 0)
-    combined_mask[loc_data] = 2
-    ct_corrected = make_correction(ct, loc_data, np.flip(source,axis), separation_point, m_2, c_2, m_3, c_3, logger)
-
-    corr_1 = ct_corrected.copy()
-    loc_data = (np.flip(masked_image1, axis) > 0) * ct
-    combined_mask[loc_data > 0] = 1
-    ct_corrected = apply_random_forest_with_bounding_boxes(loc_data, corr_1, shifter_value, bounding_boxes=bounding_boxes)
-
     return ct_corrected, combined_mask
 
 
-def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs, skip, image_file, log_dir=None):
+# ===================================================
+# FEATURE ENGINEERING
+# ===================================================
+
+def extract_features(img, coords):
+    
     """
-    Processes a single FITS image file to extract quadrant data, generate source masks,
-    and prepare for crosstalk correction using predefined correction factors.
+    Extracts feature vectors for a set of image pixels to be used by the
+    machine-learning source mask classifier.
 
-    Parameters:
-    -----------
-    plot_flag : bool
-        Flag to control plotting of intermediate or final outputs.
-    l : bool
-        Placeholder for additional data or flags.
-    v : bool
-        Placeholder for additional data or flags.
-    cal : bool
-        Calibration mode or configuration.
-    mask1_threshold : float
-        Threshold value used for source masking in quadrant Q1.
-    mask2_threshold : float
-        Threshold value used for source masking in quadrant Q2.
-    q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs : any
-        Correction factors for specific quadrant-to-quadrant crosstalks.
-    skip : list of str
-        List of crosstalk correction pairs (e.g., 'q4_q1', 'q3_q2') to skip during processing.
-    image_file : str
-        Path to the FITS image file to be processed.
-    log_dir : str, optional
-        Directory path where the processing log should be saved. If not specified, logs may not be written.
+    For each pixel, the feature vector consists of the pixel value, local
+    intensity gradients, local 3×3 standard deviation, and the normalised
+    pixel coordinates.
 
-    Returns:
-    --------
-    None
-        The function performs operations such as logging, quadrant extraction, and masking
+    Parameters
+    ----------
+    img : ndarray
+        Two-dimensional image array.
+    coords : ndarray
+        Array of pixel coordinates with shape (N, 2), where each row
+        contains the (row, column) index of a pixel.
 
-    Notes:
+    Returns
+    -------
+    ndarray
+        Feature matrix of shape (N, M), where each row contains the
+        extracted features for one pixel.
+
+    Notes
+    -----
+    The image is first smoothed with a Gaussian filter before computing
+    intensity gradients to reduce the influence of pixel-scale noise.
+    """
+
+    ny, nx = img.shape
+
+    smooth = gaussian_filter(img, sigma=1)
+    gy, gx = np.gradient(smooth)
+
+    X = []
+
+    for (j, i) in coords:
+
+        val = img[j, i]
+
+        feat = [
+            val,
+            gx[j, i],
+            gy[j, i],
+            np.std(img[max(0,j-1):j+2, max(0,i-1):i+2]),
+
+            # ===================================================
+            # COMMENT THESE OUT TO TEST OVERFITTING
+            # ===================================================
+
+            j / ny,
+            i / nx
+        ]
+
+        X.append(feat)
+
+    return np.array(X)
+
+# ===================================================
+# APPLY MODEL TO MASK
+# ===================================================
+
+def type_mask(img, mask, model):
+    
+    """
+    Classifies candidate source pixels using a trained machine-learning model.
+
+    Pixels above the detector saturation threshold are automatically classified
+    as Type I sources. Remaining candidate pixels contained within the input
+    mask are classified by the supplied machine-learning model.
+
+    Parameters
+    ----------
+    img : ndarray
+        Two-dimensional image array.
+    mask : ndarray
+        Candidate source mask. Only non-zero pixels are classified by the
+        machine-learning model.
+    model : sklearn.base.BaseEstimator
+        Trained classification model used to distinguish source pixel types.
+
+    Returns
+    -------
+    ndarray
+        Integer mask with the same shape as ``img`` containing the predicted
+        pixel classifications.
+
+    Notes
+    -----
+    Pixels with values greater than or equal to 62,500 counts are always
+    assigned to Type I without invoking the machine-learning classifier.
+    """
+
+    ny, nx = img.shape
+
+    final_mask = np.zeros((ny, nx), dtype=np.int16)
+
+    # ===================================================
+    # HARD SATURATION RULE
+    # ===================================================
+
+    final_mask[img >= 62500] = 1
+
+    # ===================================================
+    # ML REGION
+    # ===================================================
+
+    ml_region = (
+        (img < 62500) &
+        (mask != 0)
+    )
+
+    coords = np.argwhere(ml_region)
+
+    if len(coords) > 0:
+
+        X_test = extract_features(img, coords)
+
+        pred = model.predict(X_test)
+
+        for (j, i), p in zip(coords, pred):
+
+            final_mask[j, i] = p
+
+    return final_mask
+
+
+def load_and_mean_fits(input_source, logger):
+    
+    """
+    Loads one or more FITS images and returns either the image itself or the
+    mean-combined image.
+
+    The input may be a single FITS file, a comma-separated list of FITS files,
+    or a text file containing one FITS filename per line.
+
+    Parameters
+    ----------
+    input_source : str
+        Input specification. This may be:
+        - a FITS filename,
+        - a comma-separated list of FITS filenames, or
+        - a text file listing FITS filenames.
+    logger : logging.Logger
+        Logger used to record processing information.
+
+    Returns
+    -------
+    ndarray
+        The loaded FITS image if a single file is supplied, otherwise the
+        pixel-wise mean of all loaded images.
+
+    Raises
     ------
-    - The FITS image is assumed to be divided into four quadrants:
-        Q1: Top-left     [2056:4112, 0:2101]
-        Q2: Bottom-left  [0:2056,   0:2101]
-        Q3: Bottom-right [0:2056,   2101:4202]
-        Q4: Top-right    [2056:4112, 2101:4202]
+    ValueError
+        If the supplied FITS images do not all have identical dimensions.
 
-    - If crosstalk for a quadrant pair is not in the `skip` list, a mask is created for the source quadrant
-      using a specified pixel value threshold, and selected pixels are identified where counts exceed 60,000.
-
-    - Logging is configured per process (based on PID), and logs details such as mask creation.
-
-    - A large correction factor (CFs) table is hardcoded and intended to be used later in the processing
-      to perform crosstalk correction based on date, quadrant pair, and other metadata.
-
-    - Headers and layout of the CFs array are documented in the source code comment block.
+    Notes
+    -----
+    Blank lines and lines beginning with ``#`` are ignored when reading a
+    text file containing a list of FITS images.
     """
-    
-    pid = os.getpid()
-    log_file = os.path.join(log_dir, f"log_{pid}_{os.path.basename(image_file)}.log")
-    logger = setup_logger(log_file)
 
-    logger.info(f"{THIS} Started processing {image_file}")
-    
-    start_time = time.time()
-    
-    # Load the image data
-    image_data = load_fits_image(image_file, logger)
+    # -------------------------------
+    # Determine input type
+    # -------------------------------
 
-    # Extract quadrants
-    q1 = image_data[2056:4112, 0:2101]  # Q1 = Top Left
-    q2 = image_data[0:2056, 0:2101]
-    q3 = image_data[0:2056, 2101:4202]
-    q4 = image_data[2056:4112, 2101:4202]  # Q4 = Top Right
-    
+    if input_source.endswith(".txt"):
 
-    if 'q4_q1' not in skip or 'q2_q1' not in skip or 'q3_q1' not in skip:
-        final_mask_1 = get_source_mask(q1, 6000)
-        type1_pixels_1 = ((final_mask_1 > 0) * q1) > 64000
-        logger.info(f"{THIS} Mask 1 Created. [{image_file[-16:]}]")
+        # Text file with one FITS path per line
+        with open(input_source, "r") as f:
+            file_list = [
+                line.strip()
+                for line in f
+                if line.strip()
+                and not line.startswith("#")
+            ]
+
+    elif "," in input_source:
+
+        # Comma-separated list
+        file_list = [
+            x.strip()
+            for x in input_source.split(",")
+            if x.strip()
+        ]
+
+    else:
+
+        # Single file
+        file_list = [input_source]
+
+    logger.info(
+        f"{THIS} Loading {len(file_list)} SimTh file(s)"
+    )
+
+    images = []
+
+    for filename in file_list:
+
+        logger.info(
+            f"{THIS} Reading {filename}"
+        )
+
+        img = load_fits_image(
+            str(filename),
+            logger
+        )
+
+        if images and img.shape != images[0].shape:
+
+            raise ValueError(
+                f"{THIS} Shape mismatch: "
+                f"{filename}"
+            )
+
+        images.append(img)
+
+    # Single file → return directly
+    if len(images) == 1:
+        return images[0]
+
+    # Multiple files → mean combine
+    return np.mean(
+        np.stack(images),
+        axis=0
+    )
     
-    if 'q4_q2' not in skip or 'q3_q2' not in skip or 'q1_q2' not in skip:
-        final_mask_2 = get_source_mask(q2, 4000)  
-        type1_pixels_2 = ((final_mask_2 > 0) * q2) > 64000
-        logger.info(f"{THIS} Mask 2 Created. [{image_file[-16:]}]")
-   
+def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs, skip, image_file, simth_list=None, retrain_model=False, log_dir=None):
     
+    """
+    Processes a single Veloce FITS image by identifying inter-quadrant cross-talk
+    pixels, applying or calibrating cross-talk corrections, and writing the corrected
+    output.
+
+    Depending on the selected mode, the function can:
+      - Apply previously determined correction coefficients.
+      - Calibrate new correction coefficients from calibration frames.
+      - Correct Type I cross-talk using a trend-based method (default) or a
+        calibration-based method when SimTh frames are provided.
+      - Retrain the machine-learning source mask classifier before processing.
+
+    Parameters
+    ----------
+    plot_flag : bool
+        Enables diagnostic plots and additional visual output.
+        
+    l : bool
+        Indicates whether the input originated from a file list.
+        
+    v : bool
+        Enables verbose logging.
+        
+    cal : bool
+        If True, performs calibration to determine new cross-talk correction
+        coefficients instead of applying existing ones.
+        
+    mask1_threshold : int
+        Pixel threshold used when generating the first source mask.
+        
+    mask2_threshold : int
+        Pixel threshold used when generating the second source mask.
+    q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs : list
+        Polynomial correction coefficients for each quadrant-to-quadrant
+        cross-talk pair.
+        
+    skip : list of str
+        List of quadrant pairs whose corrections should be skipped
+        (e.g. ``["q1_q2", "q3_q1"]``).
+        
+    image_file : str
+        Path to the FITS image to process.
+        
+    simth_list : list of str, optional
+        List of SimTh calibration frames used for the calibration-based
+        Type I correction method. If None, the default trend-based Type I
+        correction is used.
+        
+    retrain_model : bool, optional
+        If True, retrains the source mask classifier before processing.
+        
+    log_dir : str, optional
+        Directory where the process-specific log file is written.
+
+    Returns
+    -------
+    None
+        The corrected FITS file and associated outputs are written to disk.
+        Processing information is recorded in the log files.
+
+    Notes
+    -----
+    - The detector is divided into four quadrants:
+
+          Q1 : Top-left
+          Q2 : Bottom-left
+          Q3 : Bottom-right
+          Q4 : Top-right
+
+    - Only quadrant pairs not listed in ``skip`` are processed.
+
+    - A separate logger is created for each worker process, allowing logs from parallel processing to be merged into a single chronological log after processing completes.
+
+    - When ``cal`` is enabled, the function derives new correction coefficients rather than applying existing ones.
+
+    - Unless ``retrain_model`` is specified, previously trained machine-learning models are used to classify source pixels.
+
+    """
+
+    try:
+        pid = os.getpid()
+        log_file = os.path.join(log_dir, f"log_{pid}_{os.path.basename(image_file)}.log")
+        logger = setup_logger(log_file)
+
+        logger.info(f"{THIS} Started processing {image_file}")
+
+        start_time = time.time()
+
+        # Load the image data
+        image_data = load_fits_image(image_file, logger)
+        
+        if simth_list is not None:
+            simth_file = load_and_mean_fits(
+                simth_list,
+                logger
+            )
+
+            q1_simth = simth_file[2056:4112, 0:2101]
+            q2_simth = simth_file[0:2056, 0:2101]
+            q3_simth = simth_file[0:2056, 2101:4202]
+            q4_simth = simth_file[2056:4112, 2101:4202]
+
+
+        # Extract quadrants
+        q1 = image_data[2056:4112, 0:2101]  # Q1 = Top Left
+        q2 = image_data[0:2056, 0:2101]
+        q3 = image_data[0:2056, 2101:4202]
+        q4 = image_data[2056:4112, 2101:4202]  # Q4 = Top Right
+     
+    except Exception as e:
+        logger.error(f"{THIS}{e}", file=sys.stderr)
+    
+    
+    try:
+
+        MODEL_FILES = {"Q1": os.path.join(CAL_FILES_DIR, "model_Q1.pkl"),
+                       "Q2": os.path.join(CAL_FILES_DIR, "model_Q2.pkl")
+                      }
+
+        QUADRANTS = {
+            "Q1": (slice(2056, 4112), slice(0, 2101)),
+            "Q2": (slice(0, 2056), slice(0, 2101))
+        }
+
+        models = {}
+        validation_results = {}
+
+        # ==========================================================
+        # LOAD EXISTING MODELS IF PRESENT
+        # ==========================================================
+
+        all_exist = all(os.path.exists(f) for f in MODEL_FILES.values())
+
+        if all_exist and not retrain_model:
+
+            logger.info(f"{THIS} Loading existing models...")
+
+            for name, path in MODEL_FILES.items():
+                models[name] = joblib.load(path)
+                logger.info(f"{THIS} Loaded {name}: {path}")
+
+        else:
+
+            logger.info(f"{THIS} Training models...")
+
+            train_folder = os.path.join(
+                CAL_FILES_DIR,
+                "mask_sample"
+            )
+
+            train_files = glob.glob(
+                os.path.join(train_folder, "*oc.fits")
+            )
+
+            # Storage for each quadrant
+            X_data = {k: [] for k in QUADRANTS}
+            y_data = {k: [] for k in QUADRANTS}
+
+            # ======================================================
+            # SINGLE PASS THROUGH FILES
+            # ======================================================
+
+            for f in tqdm(
+                train_files,
+                desc="Reading training files",
+                unit="file"
+            ):
+
+                try:
+
+                    with fits.open(f) as hdul:
+
+                        if len(hdul) < 2:
+                            continue
+
+                        full_img = hdul[0].data
+                        full_mask = np.fliplr(hdul[1].data)
+
+                        for name, (ys, xs) in QUADRANTS.items():
+
+                            img = full_img[ys, xs]
+                            mask = full_mask[ys, xs]
+
+                            valid = (
+                                (img < 62500) &
+                                (mask != 0)
+                            )
+
+                            coords = np.argwhere(valid)
+
+                            if len(coords) == 0:
+                                continue
+
+                            X_data[name].append(
+                                extract_features(img, coords)
+                            )
+
+                            y_data[name].append(
+                                mask[valid]
+                            )
+
+                except Exception as e:
+
+                    logger.error(f"{THIS} Skipping {f}: {e}")
+
+            # ======================================================
+            # TRAIN ONE MODEL PER QUADRANT
+            # ======================================================
+
+            for name in QUADRANTS:
+
+                logger.info(f"{THIS} Training {name}")
+
+                X_train = np.vstack(X_data[name])
+                y_train = np.hstack(y_data[name])
+
+                logger.info(
+                    f"{THIS}{name}: "
+                    f"{THIS}{X_train.shape[0]:,} samples, "
+                    f"{THIS}{X_train.shape[1]} features"
+                )
+
+                Xtr, Xte, ytr, yte = train_test_split(
+                    X_train,
+                    y_train,
+                    test_size=0.2,
+                    random_state=42,
+                    stratify=y_train
+                )
+
+                model = RandomForestClassifier(
+                    n_estimators=250,      # faster than 400
+                    max_depth=25,
+                    n_jobs=-1,
+                    random_state=42,
+                    oob_score=True
+                )
+
+                model.fit(Xtr, ytr)
+
+                pred = model.predict(Xte)
+                
+                validation_results[name] = {
+                    "Xte": Xte,
+                    "yte": yte,
+                    "pred": pred
+                }
+
+                logger.info(f"{THIS} {name}")
+                logger.info(f"{THIS} OOB Score : {model.oob_score_:.5f}")
+                logger.info(f"{THIS} Accuracy  : {accuracy_score(yte, pred):.5f}")
+
+                logger.info(
+                    classification_report(
+                        yte,
+                        pred
+                    )
+                )
+
+                joblib.dump(
+                    model,
+                    MODEL_FILES[name]
+                )
+
+                logger.info(
+                    f"{THIS} Saved to {MODEL_FILES[name]}"
+                )
+
+                models[name] = model
+                
+            
+            # ===================================================
+            # EVALUATE BOTH QUADRANT MODELS
+            # ===================================================
+
+            feature_names = [
+                "pixel_value",
+                "gx",
+                "gy",
+                "local_std",
+                "y_position",
+                "x_position"
+            ]
+
+            test_file = train_files[0]
+
+            for name, (ys, xs) in QUADRANTS.items():
+
+                model = models[name]
+
+                logger.info(f"{THIS} ======================================")
+                logger.info(f"{THIS} VALIDATION FOR {name}")
+                logger.info(f"{THIS} ======================================")
+
+                # -------------------------------------------
+                # Reload quadrant from test image
+                # -------------------------------------------
+
+                with fits.open(test_file) as hdul:
+
+                    img = hdul[0].data[ys, xs]
+
+                    true_mask = np.fliplr(
+                        hdul[1].data
+                    )[ys, xs]
+
+                valid = (
+                    (img < 62500) &
+                    (true_mask != 0)
+                )
+
+                coords = np.argwhere(valid)
+
+                X_test = extract_features(
+                    img,
+                    coords
+                )
+
+                y_true = true_mask[valid]
+
+                pred = model.predict(X_test)
+
+                # -------------------------------------------
+                # Metrics
+                # -------------------------------------------
+
+                acc = accuracy_score(
+                    y_true,
+                    pred
+                )
+
+                logger.info(f"{THIS} Accuracy: {acc:.5f}")
+
+                logger.info(
+                    classification_report(
+                        y_true,
+                        pred
+                    )
+                )
+
+                cm = confusion_matrix(
+                    y_true,
+                    pred
+                )
+
+                logger.info(f"{THIS} Confusion Matrix:\n")
+                logger.info(THIS, cm)
+
+                plt.figure(figsize=(6, 6))
+
+                plt.imshow(cm)
+
+                plt.colorbar()
+
+                plt.xlabel("Predicted")
+
+                plt.ylabel("True")
+
+                plt.title(
+                    f"Confusion Matrix ({name})"
+                )
+
+                plt.tight_layout()
+
+                plt.show()
+
+                # -------------------------------------------
+                # Feature Importance
+                # -------------------------------------------
+
+                logger.info(f"{THIS} ======================================")
+                logger.info(f"{THIS} FEATURE IMPORTANCE ({name})")
+                logger.info(f"{THIS} ======================================")
+
+                for fname, importance in zip(
+                    feature_names,
+                    model.feature_importances_
+                ):
+
+                    logger.info(
+                        f"{THIS}{fname:15s} : {importance:.5f}"
+                    )
+
+                # -------------------------------------------
+                # Full-image prediction
+                # -------------------------------------------
+
+                input_mask = (
+                    true_mask != 0
+                ).astype(np.int16)
+
+                pred_mask = type_mask(
+                    img,
+                    input_mask,
+                    model
+                )
+
+                error_map = (
+                    pred_mask != true_mask
+                )
+
+                # -------------------------------------------
+                # Visualisation
+                # -------------------------------------------
+
+                fig, ax = plt.subplots(
+                    1,
+                    4,
+                    figsize=(20, 5)
+                )
+
+                y0 = 2380-2056
+                y1 = 2495-2056
+
+                x0 = 1280
+                x1 = 1289
+
+                ax[0].imshow(
+                    img[y0:y1, x0:x1],
+                    cmap="gray"
+                )
+
+                ax[0].set_title("Image")
+
+                ax[1].imshow(
+                    true_mask[y0:y1, x0:x1]
+                )
+
+                ax[1].set_title("Ground Truth")
+
+                ax[2].imshow(
+                    pred_mask[y0:y1, x0:x1]
+                )
+
+                ax[2].set_title("Predicted Mask")
+
+                ax[3].imshow(
+                    error_map[y0:y1, x0:x1],
+                    cmap="hot"
+                )
+
+                ax[3].set_title("Error Map")
+
+                for a in ax:
+
+                    a.set_xticks([])
+
+                    a.set_yticks([])
+
+                plt.tight_layout()
+
+                plt.show()
+
+                # -------------------------------------------
+                # Pixel Error Rate
+                # -------------------------------------------
+
+                pixel_error = np.mean(
+                    pred_mask != true_mask
+                )
+
+                logger.info(
+                    f"{THIS}{name} Pixel error rate: "
+                    f"{THIS}{pixel_error:.6f}"
+                )
+
+            logger.info(f"{THIS} Done.")
+
+    except Exception as e:
+        logger.error(f"{THIS}{e}", file=sys.stderr)
+    
+    
+    try:
+
+        if 'q4_q1' not in skip or 'q2_q1' not in skip or 'q3_q1' not in skip:
+
+            final_mask_1 = get_source_mask(
+                q1,
+                mask1_threshold,
+                sat_lim=62500
+            )
+
+            type_mask_1 = type_mask(
+                q1,
+                final_mask_1,
+                models["Q1"]
+            )
+
+            logger.info(
+                f"{THIS} Mask 1 Created. "
+                f"[{image_file[-16:]}]"
+            )
+
+        if 'q4_q2' not in skip or 'q3_q2' not in skip or 'q1_q2' not in skip:
+
+            final_mask_2 = get_source_mask(
+                q2,
+                mask2_threshold,
+                sat_lim=62500
+            )
+
+            type_mask_2 = type_mask(
+                q2,
+                final_mask_2,
+                models["Q2"]
+            )
+
+            logger.info(
+                f"{THIS} Mask 2 Created. "
+                f"[{image_file[-16:]}]"
+            )
+
+    except Exception as e:
+
+        logger.error(f"{e}", file=sys.stderr)
+        
+        
+    # Importing some important masks for processing
+    image_data_lc = load_fits_image(os.path.join(CAL_FILES_DIR, "mask1_LC_4.fits"), logger)
+    image_data_th = load_fits_image(os.path.join(CAL_FILES_DIR, "mask1_TH_4.fits"), logger)
+
+    lc_on = check_lfc_lines(image_file, logger)
+
+    # Extract quadrants_simth
+    q1_th = (image_data_th[2056:4112, 0:2101] == 0) # Q1 = Top Left
+    q2_th = (image_data_th[0:2056, 0:2101] == 0)
+    q3_th = (image_data_th[0:2056, 2101:4202] == 0)
+    q4_th = (image_data_th[2056:4112, 2101:4202] == 0)  # Q4 = Top Right
+
+    # Extract quadrants_lc
+    q1_lc = (image_data_lc[2056:4112, 0:2101] == 0)  # Q1 = Top Left
+    q2_lc = (image_data_lc[0:2056, 0:2101] == 0)
+    q3_lc = (image_data_lc[0:2056, 2101:4202] == 0)
+    q4_lc = (image_data_lc[2056:4112, 2101:4202] == 0)  # Q4 = Top Right
+        
+ 
     """
     Headers for CFs Array:
     Year, Mode, UTMJD_0, UTMJD_1, Q4_Q1_T1, Q4_Q1_T2_M, Q4_Q1_T2_ME, Q4_Q1_T2_C, Q4_Q1_T2_CE, Q4_Q1_T3_M, Q4_Q1_T3_ME, Q4_Q1_T3_C, Q4_Q1_T3_CE, Q4_Q2_T1, Q4_Q2_T2_M, Q4_Q2_T2_ME, Q4_Q2_T2_C, Q4_Q2_T2_CE, Q4_Q2_T3_M, Q4_Q2_T3_ME, Q4_Q2_T3_C, Q4_Q2_T3_CE, Q3_Q2_T1, Q3_Q2_T2_M, Q3_Q2_T2_ME, Q3_Q2_T2_C, Q3_Q2_T2_CE, Q3_Q2_T3_M, Q3_Q2_T3_ME, Q3_Q2_T3_C, Q3_Q2_T3_CE, Q2_Q1_T1, Q2_Q1_T2_M, Q2_Q1_T2_ME, Q2_Q1_T2_C, Q2_Q1_T2_CE, Q2_Q1_T3_M, Q2_Q1_T3_ME, Q2_Q1_T3_C, Q2_Q1_T3_CE, Q1_Q2_T1, Q1_Q2_T2_M, Q1_Q2_T2_ME, Q1_Q2_T2_C, Q1_Q2_T2_CE, Q1_Q2_T3_M, Q1_Q2_T3_ME, Q1_Q2_T3_C, Q1_Q2_T3_CE, Q3_Q1_T1, Q3_Q1_T2_M, Q3_Q1_T2_ME, Q3_Q1_T2_C, Q3_Q1_T2_CE, Q3_Q1_T3_M, Q3_Q1_T3_ME, Q3_Q1_T3_C, Q3_Q1_T3_CE
@@ -1608,119 +2595,108 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
     amp = amp_mode(CFs, mjd_row, logger)
       
     ct_mask = np.zeros_like(image_data)
+
+
+    try:
     
-    if cal:
- 
-        # Importing some important masks for processing
-        image_data_lc = load_fits_image(os.path.join(CAL_FILES_DIR, "mask1_LC_4.fits"), logger)
-        image_data_th = load_fits_image(os.path.join(CAL_FILES_DIR, "mask1_TH_4.fits"), logger)
-       
-        lc_on = check_lfc_lines(image_file, logger)
-  
-        # Extract quadrants_simth
-        q1_th = (image_data_th[2056:4112, 0:2101] == 0) # Q1 = Top Left
-        q2_th = (image_data_th[0:2056, 0:2101] == 0)
-        q3_th = (image_data_th[0:2056, 2101:4202] == 0)
-        q4_th = (image_data_th[2056:4112, 2101:4202] == 0)  # Q4 = Top Right
-  
-        # Extract quadrants_lc
-        q1_lc = (image_data_lc[2056:4112, 0:2101] == 0)  # Q1 = Top Left
-        q2_lc = (image_data_lc[0:2056, 0:2101] == 0)
-        q3_lc = (image_data_lc[0:2056, 2101:4202] == 0)
-        q4_lc = (image_data_lc[2056:4112, 2101:4202] == 0)  # Q4 = Top Right
-        
-        # Corr 4 with 1
-        if 'q4_q1' not in skip and amp in (4, 2):
-            image_data[2056:4112, 2101:4202], ct_mask[2056:4112, 2101:4202] = get_correction(image_file, final_mask_1, type1_pixels_1, q1, q4, *q4_q1_cfs, plot_flag, v, q4_th, q4_lc, lc_on, logger, loc = "4_1", axis=1)
-            logger.info(f"{THIS} Correction to Q4 with Q1 Done!! [{image_file[-16:]}]")
-       
-        # Corr 4 with 2
-        if 'q4_q2' not in skip and amp == 4:
-            image_data[2056:4112, 2101:4202], array_1 = get_correction(image_file, final_mask_2, type1_pixels_2, q2, q4, *q4_q2_cfs, plot_flag, v, q4_th, q4_lc, lc_on, logger, loc = "4_2", axis=None)
+        if cal:
             
-            region = ct_mask[2056:4112, 2101:4202]
-            updated_region = np.where(array_1 != 0, array_1, region)
-            ct_mask[2056:4112, 2101:4202] = updated_region
-            logger.info(f"{THIS} Correction to Q4 with Q2 Done!! [{image_file[-16:]}]")
+            # Corr 4 with 1
+            if 'q4_q1' not in skip and amp in (4, 2):
+                image_data[2056:4112, 2101:4202], ct_mask[2056:4112, 2101:4202] = get_correction(image_file, type_mask_1, *q4_q1_cfs, v, plot_flag, q1, q4, logger, q4_th, q4_lc, lc_on, q4_simth if simth_list is not None else None, loc = "4_1", axis = 1)
+                logger.info(f"{THIS} Correction to Q4 with Q1 Done!! [{image_file[-16:]}]")
 
-        # Corr 3 with 1
-        if 'q3_q1' not in skip and amp == 4:
-            image_data[0:2056, 2101:4202], ct_mask[0:2056, 2101:4202] = get_correction(image_file, final_mask_1, type1_pixels_1, q1, q3, *q3_q1_cfs, plot_flag, v, q3_th, q3_lc, lc_on, logger, loc = "3_1", axis=None)
-            logger.info(f"{THIS} Correction to Q3 with Q1 Done!! [{image_file[-16:]}]")
+            # Corr 4 with 2
+            if 'q4_q2' not in skip and amp == 4:
+                image_data[2056:4112, 2101:4202], array_1 = get_correction(image_file, type_mask_2, *q4_q2_cfs, v, plot_flag, q1, q4, logger, q4_th, q4_lc, lc_on, q4_simth if simth_list is not None else None, loc = "4_2", axis = None)
 
-        # Corr 3 with 2
-        if 'q3_q2' not in skip and amp in (4, 2):
-            image_data[0:2056, 2101:4202], array_2 = get_correction(image_file, final_mask_2, type1_pixels_2, q2, q3, *q3_q2_cfs, plot_flag, v, q3_th, q3_lc, lc_on, logger, loc = "3_2", axis=1)
-            
-            region = ct_mask[0:2056, 2101:4202]
-            updated_region = np.where(array_2 != 0, array_2, region)
-            ct_mask[0:2056, 2101:4202] = updated_region
-            logger.info(f"{THIS} Correction to Q3 with Q2 Done!! [{image_file[-16:]}]")
+                region = ct_mask[2056:4112, 2101:4202]
+                updated_region = np.where(array_1 != 0, array_1, region)
+                ct_mask[2056:4112, 2101:4202] = updated_region
+                logger.info(f"{THIS} Correction to Q4 with Q2 Done!! [{image_file[-16:]}]")
 
-        # Corr 2 with 1
-        if 'q2_q1' not in skip and amp == 4:
-            image_data[0:2056, 0:2101], ct_mask[0:2056, 0:2101] = get_correction(image_file, final_mask_1, type1_pixels_1, q1, q2, *q2_q1_cfs, plot_flag, v, q2_th, q2_lc, lc_on, logger, loc = "2_1", axis = 0)
-            logger.info(f"{THIS} Correction to Q2 with Q1 Done!! [{image_file[-16:]}]")
+            # Corr 3 with 1
+            if 'q3_q1' not in skip and amp == 4:
+                image_data[0:2056, 2101:4202], ct_mask[0:2056, 2101:4202] = get_correction(image_file, type_mask_1, *q3_q1_cfs, v, plot_flag, q1, q2, logger, q3_th, q3_lc, lc_on, q3_simth if simth_list is not None else None, loc = "3_1", axis = None)
+                logger.info(f"{THIS} Correction to Q3 with Q1 Done!! [{image_file[-16:]}]")
 
-        # Corr 1 with 2
-        if 'q1_q2' not in skip and amp == 4:
-            image_data[2056:4112, 0:2101], ct_mask[2056:4112, 0:2101] = get_correction(image_file, final_mask_2, type1_pixels_2, q2, q1, *q1_q2_cfs, plot_flag, v, q1_th, q1_lc, lc_on, logger, loc = "1_2", axis = 0)
-            logger.info(f"{THIS} Correction to Q1 with Q2 Done!! [{image_file[-16:]}]")
+            # Corr 3 with 2
+            if 'q3_q2' not in skip and amp in (4, 2):
+                image_data[0:2056, 2101:4202], array_2 = get_correction(image_file, type_mask_2, *q3_q2_cfs, v, plot_flag, q2, q3, logger, q3_th, q3_lc, lc_on, q3_simth if simth_list is not None else None, loc = "3_2", axis = 1)
+
+                region = ct_mask[0:2056, 2101:4202]
+                updated_region = np.where(array_2 != 0, array_2, region)
+                ct_mask[0:2056, 2101:4202] = updated_region
+                logger.info(f"{THIS} Correction to Q3 with Q2 Done!! [{image_file[-16:]}]")
+
+            # Corr 2 with 1
+            if 'q2_q1' not in skip and amp == 4:
+                image_data[0:2056, 0:2101], ct_mask[0:2056, 0:2101] = get_correction(image_file, type_mask_1, *q2_q1_cfs, v, plot_flag, q1, q2, logger, q2_th, q2_lc, lc_on, q2_simth if simth_list is not None else None, loc = "2_1", axis = 0)
+                logger.info(f"{THIS} Correction to Q2 with Q1 Done!! [{image_file[-16:]}]")
+
+            # Corr 1 with 2
+            if 'q1_q2' not in skip and amp == 4:
+                image_data[2056:4112, 0:2101], ct_mask[2056:4112, 0:2101] = get_correction(image_file, type_mask_2, *q1_q2_cfs, v, plot_flag, q2, q1, logger, q1_th, q1_lc, lc_on, q1_simth if simth_list is not None else None, loc = "1_2", axis = 0)
+                logger.info(f"{THIS} Correction to Q1 with Q2 Done!! [{image_file[-16:]}]")
+
+
+        else: 
+
+
+            warning_ranges = [
+                (58581.4, 58615.9),
+                (58912.2, 59037.9),
+                (59178.2, 59179.8),
+                (59745.0, 59926.5)
+            ]
+
+            if any(start <= mjd_input <= end for start, end in warning_ranges):
+                logger.info(f"{THIS} Warning: you might want to recompute correction coefficients for this night.")
+
+            # Corr 4 with 1
+            if 'q4_q1' not in skip and amp in (4, 2):
+                image_data[2056:4112, 2101:4202], ct_mask[2056:4112, 2101:4202] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, type_mask_1, v, plot_flag, q1, q4, logger, q4_th, q4_lc, lc_on, q4_simth if simth_list is not None else None, shifter_value=0, loc = "4_1", axis=1)
+
+                logger.info(f"{THIS} Correction to Q4 with Q1 Done!! [{image_file[-16:]}]")
+
+            # Corr 4 with 2
+            if 'q4_q2' not in skip and amp == 4:
+                image_data[2056:4112, 2101:4202], array_1 = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, type_mask_2, v, plot_flag, q2, q4, logger, q4_th, q4_lc, lc_on, q4_simth if simth_list is not None else None, shifter_value=0, loc = "4_2", axis=None)
+
+                region = ct_mask[2056:4112, 2101:4202]
+                updated_region = np.where(array_1 != 0, array_1, region)
+                ct_mask[2056:4112, 2101:4202] = updated_region
+                logger.info(f"{THIS} Correction to Q4 with Q2 Done!! [{image_file[-16:]}]")
+
+            # Corr 3 with 1
+            if 'q3_q1' not in skip and amp == 4:
+                image_data[0:2056, 2101:4202], ct_mask[0:2056, 2101:4202] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, type_mask_1, v, plot_flag, q1, q3, logger, q3_th, q3_lc, lc_on, q3_simth if simth_list is not None else None, shifter_value=0, loc = "3_1", axis=None)
+                
+                logger.info(f"{THIS} Correction to Q3 with Q1 Done!! [{image_file[-16:]}]")
+
+            # Corr 3 with 2
+            if 'q3_q2' not in skip and amp in (4, 2):
+                image_data[0:2056, 2101:4202], array_2 = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, type_mask_2, v, plot_flag, q2, q3, logger, q3_th, q3_lc, lc_on, q3_simth if simth_list is not None else None, shifter_value=0, loc = "3_2", axis=1)
+
+                region = ct_mask[0:2056, 2101:4202]
+                updated_region = np.where(array_2 != 0, array_2, region)
+                ct_mask[0:2056, 2101:4202] = updated_region
+                logger.info(f"{THIS} Correction to Q3 with Q2 Done!! [{image_file[-16:]}]")
+
+            # Corr 2 with 1
+            if 'q2_q1' not in skip and amp == 4:
+                image_data[0:2056, 0:2101], ct_mask[0:2056, 0:2101] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, type_mask_1, v, plot_flag, q1, q2, logger, q2_th, q2_lc, lc_on, q2_simth if simth_list is not None else None, shifter_value=0, loc = "2_1", axis=0)
+                logger.info(f"{THIS} Correction to Q2 with Q1 Done!! [{image_file[-16:]}]")
+
+            # Corr 1 with 2
+            if 'q1_q2' not in skip and amp == 4:
+                image_data[2056:4112, 0:2101], ct_mask[2056:4112, 0:2101] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, type_mask_1, v, plot_flag, q2, q1, logger, q1_th, q1_lc, lc_on, q1_simth if simth_list is not None else None, shifter_value=0, loc = "1_2", axis=0)
+                logger.info(f"{THIS} Correction to Q1 with Q2 Done!! [{image_file[-16:]}]")
     
-
-    else: 
-        
-        
-        warning_ranges = [
-            (58581.4, 58615.9),
-            (58912.2, 59037.9),
-            (59178.2, 59179.8),
-            (59745.0, 59926.5)
-        ]
-
-        if any(start <= mjd_input <= end for start, end in warning_ranges):
-            print("Warning: you might want to recompute correction coefficients for this night.")
-        
-        
-        # Corr 4 with 1
-        if 'q4_q1' not in skip and amp in (4, 2):
-            image_data[2056:4112, 2101:4202], ct_mask[2056:4112, 2101:4202] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_1, type1_pixels_1, v, plot_flag, q1, q4, logger, shifter_value=0, loc = "4_1", axis=1)
-            logger.info(f"{THIS} Correction to Q4 with Q1 Done!! [{image_file[-16:]}]")
-
-        # Corr 4 with 2
-        if 'q4_q2' not in skip and amp == 4:
-            image_data[2056:4112, 2101:4202], array_1 = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_2, type1_pixels_2, v, plot_flag, q2, q4, logger, shifter_value=0, loc = "4_2", axis=None)
-            
-            region = ct_mask[2056:4112, 2101:4202]
-            updated_region = np.where(array_1 != 0, array_1, region)
-            ct_mask[2056:4112, 2101:4202] = updated_region
-            logger.info(f"{THIS} Correction to Q4 with Q2 Done!! [{image_file[-16:]}]")
-
-        # Corr 3 with 1
-        if 'q3_q1' not in skip and amp == 4:
-            image_data[0:2056, 2101:4202], ct_mask[0:2056, 2101:4202] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_1, type1_pixels_1, v, plot_flag, q1, q3, logger, shifter_value=0, loc = "3_1", axis=None)
-            logger.info(f"{THIS} Correction to Q3 with Q1 Done!! [{image_file[-16:]}]")
-
-        # Corr 3 with 2
-        if 'q3_q2' not in skip and amp in (4, 2):
-            image_data[0:2056, 2101:4202], array_2 = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_2, type1_pixels_2, v, plot_flag, q2, q3, logger, shifter_value=0, loc = "3_2", axis=1)
-            
-            region = ct_mask[0:2056, 2101:4202]
-            updated_region = np.where(array_2 != 0, array_2, region)
-            ct_mask[0:2056, 2101:4202] = updated_region
-            logger.info(f"{THIS} Correction to Q3 with Q2 Done!! [{image_file[-16:]}]")
-
-        # Corr 2 with 1
-        if 'q2_q1' not in skip and amp == 4:
-            image_data[0:2056, 0:2101], ct_mask[0:2056, 0:2101] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_1, type1_pixels_1, v, plot_flag, q1, q2, logger, shifter_value=0, loc = "2_1", axis=0)
-            logger.info(f"{THIS} Correction to Q2 with Q1 Done!! [{image_file[-16:]}]")
-
-        # Corr 1 with 2
-        if 'q1_q2' not in skip and amp == 4:
-            image_data[2056:4112, 0:2101], ct_mask[2056:4112, 0:2101] = correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask_2, type1_pixels_2, v, plot_flag, q2, q1, logger, shifter_value=0, loc = "1_2", axis=0)
-            logger.info(f"{THIS} Correction to Q1 with Q2 Done!! [{image_file[-16:]}]")
     
-
+    except Exception as e:
+        logger.error(f"{THIS}{e}", file=sys.stderr)
+    
     # Save results
     corrected_file_name = image_file.replace("o.fits", "oc.fits")
     #save_fits_images(image_data, corrected_file_name)
@@ -1738,10 +2714,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Process Veloce FITS files to either apply, or calibrate for, inter-quadrant cross-talk corrections."
     )
-    parser.add_argument('-p', action='store_true', help="Enable diagnostic plotting and printing.")
+    parser.add_argument('-p', default=False, action='store_true', help="Enable diagnostic plotting and printing.")
     parser.add_argument('-l', type=str, default=None, help="Path to a text file listing filenames to process.")
     parser.add_argument('-v', default=False, action='store_true', help="Be more verbose in logging.")
     parser.add_argument('-cal', default=False, action='store_true', help="Calibrate to create new correction coefficients.")
+    parser.add_argument('-cal_t1_corr', type=str, default=None, help="Use SimTh frames to correct type I cross-talk. Provide a list of SimTh files.")
+    parser.add_argument('--retrain-model', action='store_true', help="Force retraining of the mask classifier.")
     parser.add_argument('--mask1_threshold', type=int, default=6000, help="Threshold for Mask 1.")
     parser.add_argument('--mask2_threshold', type=int, default=4000, help="Threshold for Mask 2.")
     parser.add_argument('--q4_q1_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q4 from Q1.")
@@ -1796,10 +2774,10 @@ def main():
         logger.info(f"{THIS} Optimal MAX_FILES_AT_A_TIME: {MAX_FILES_AT_A_TIME}")
 
         # Pass log_dir to subprocesses
-        temp_log_dir = process_files_in_batches(files_to_process, args, log_dir=temp_log_dir)
+        temp_log_dir = process_files_in_batches(files_to_process, args, logger, log_dir=temp_log_dir)
     
     except Exception:
-        logger.exception("An error occurred during processing.")
+        logger.exception(f"{THIS} An error occurred during processing.")
 
     finally:
         # ---- Always run this: combine + clean up ----
@@ -1819,9 +2797,9 @@ def main():
                 for _, line in all_log_lines:
                     fout.write(line)
 
-            logger.info(f"Combined logs written to {final_log}")
+            logger.info(f"{THIS} Combined logs written to {final_log}")
         except Exception as e:
-            print(f"Failed to merge logs: {e}", file=sys.stderr)
+            logger.error(f"{THIS} Failed to merge logs: {e}", file=sys.stderr)
 
         # Cleanup
         def force_remove(func, path, exc_info):
@@ -1829,21 +2807,21 @@ def main():
                 os.chmod(path, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
                 func(path)
             except Exception as inner_e:
-                print(f"Failed to delete {path}: {inner_e}", file=sys.stderr)
+                logger.error(f"{THIS} Failed to delete {path}: {inner_e}", file=sys.stderr)
 
         try:
             shutil.rmtree(temp_log_dir, onerror=force_remove)
             if os.path.exists(temp_log_dir):
-                print(f"Warning: {temp_log_dir} still exists after shutil.rmtree. Attempting rm -rf...", file=sys.stderr)
+                logger.error(f"{THIS} Warning: {temp_log_dir} still exists after shutil.rmtree. Attempting rm -rf...", file=sys.stderr)
                 subprocess.run(["rm", "-rf", temp_log_dir])
                 if os.path.exists(temp_log_dir):
-                    print(f"ERROR: Could not delete {temp_log_dir} even with rm -rf", file=sys.stderr)
+                    logger.error(f"{THIS} ERROR: Could not delete {temp_log_dir} even with rm -rf", file=sys.stderr)
                 else:
-                    print(f"Deleted {temp_log_dir} using rm -rf")
+                    logger.info(f"{THIS} Deleted {temp_log_dir} using rm -rf")
             else:
-                print(f"Deleted {temp_log_dir}")
+                logger.info(f"{THIS} Deleted {temp_log_dir}")
         except Exception as e:
-            print(f"Final cleanup failed: {e}", file=sys.stderr)
+            logger.error(f"{THIS} Final cleanup failed: {e}", file=sys.stderr)
             
 # Restore stderr
 sys.stderr = sys.__stderr__
