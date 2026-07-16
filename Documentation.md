@@ -15,6 +15,8 @@ The script includes two functions, `main()` and `process_file()`, which handle u
 | `-l FILE` | String | `None` | Path to a text file listing filenames to process. |
 | `-v` | Flag | `False` | Enable verbose logging. |
 | `-cal` | Flag | `False` | Calibrate to create new correction coefficients. |
+| `-cal_t1_corr` | String | `None` | Use SimTh frames to correct type I cross-talk. Provide a list of SimTh files. |
+| `--retrain-model` | Flag | `False` | Force retraining of the mask classifier. |
 | `--mask1_threshold` | Integer | `6000` | Threshold for mask from Q1. |
 | `--mask2_threshold` | Integer | `4000` | Threshold for mask from Q2. |
 | `--q4_q1_cfs` | String | `"[0,None,None,None,None]"` | Correction coefficients for Q4 from Q1. `None` can be changed to any number. |
@@ -23,10 +25,10 @@ The script includes two functions, `main()` and `process_file()`, which handle u
 | `--q3_q1_cfs` | String | `"[0,None,None,None,None]"` | Correction coefficients for Q3 from Q1. |
 | `--q2_q1_cfs` | String | `"[0,None,None,None,None]"` | Correction coefficients for Q2 from Q1. |
 | `--q1_q2_cfs` | String | `"[0,None,None,None,None]"` | Correction coefficients for Q1 from Q2. |
-| `--skip` | String | `""` | Comma‑separated list of corrections to skip, e.g., `q1_q2,q2_q1`. |
+| `--skip` | String | `None` | Comma‑separated list of corrections to skip, e.g., `q1_q2,q2_q1`. |
 | `files` | List | `[]` | Directories, glob patterns, or filenames to process. |
 
-- **`process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs, skip, image_file, log_dir=None)`**  
+- **`process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs, skip, image_file, simth_list=None, retrain_model=False, log_dir=None)`**  
   This function serves as the initial stage of preprocessing. It handles tasks such as reading the FITS file, dividing it into separate quadrants, and interpreting the user’s input to determine which operations to perform. Based on the command, it then routes each image quadrant to the appropriate functions—for example, to generate a source mask, create a calibration, or apply default correction coefficients for cross-talk correction. Finally, it saves the corrected image to the specified path. All relevant commands are listed in the table above.
 
 ## Logging
@@ -276,18 +278,3 @@ Once all locations requiring correction have been identified and the correspondi
 
   **Returns:**  
   - `np.ndarray`: Quadrant with corrected Type I cross-talk.
-
-- **`make_correction(ct, loc_data, source, separation_point, m_2, c_2, m_3, c_3, logger)`**  
-  Applies corrections to an array using a source array. The correction differs depending on whether pixels are Type II or III.
-
-  **Args:**  
-  - `array (np.ndarray)`: Array to apply the correction to.  
-  - `loc_data (np.ndarray)`: 2D array of locations to correct.  
-  - `source (np.ndarray)`: Source data array used for correction.  
-  - `separation_point (float)`: Threshold separating Type II and III pixels.  
-  - `m_2, c_2 (float)`: Slope and intercept for Type II correction.  
-  - `m_3, c_3 (float)`: Slope and intercept for Type III correction.  
-  - `logger (logging.Logger)`: Logger instance for errors.
-
-  **Returns:**  
-  - `np.ndarray`: Quadrant with corrected Type II and III pixels.
