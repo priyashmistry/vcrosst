@@ -176,6 +176,18 @@ It is essential to apply corrections at the appropriate locations using the corr
     - `m_2e`, `m_3e`: Uncertainties of slopes  
     - `c_2`, `c_3`: Calibration intercepts  
     - `c_2e`, `c_3e`: Uncertainties of intercepts
+   
+- **`load_and_mean_fits(input_source, logger)`**
+  Loads one or more FITS images and returns either the input image or their pixel-wise mean. The input may be a single FITS file, a comma-separated list of FITS files, or a text file containing one FITS filename per line. If multiple images are provided, they are averaged after verifying that all have identical dimensions.
+
+  **Args:**
+  
+  - `input_source (str)`: Input specification. Can be a FITS filename, a comma-separated list of FITS filenames, or a text file containing FITS filenames.
+  - `logger (logging.Logger)`: Logger used to record processing information.
+  
+  **Returns:**
+  
+  - `np.ndarray`: Loaded FITS image if a single file is supplied; otherwise, the pixel-wise mean of all loaded FITS images.
 
 ## Pre-processing
 After extracting the data and corresponding image for a given file, some preprocessing steps are required—such as dividing the image into four quadrants and generating a mask from the two source quadrants, Q1 and Q2. Based on user inputs, the script then decides whether to use the default correction coefficients or to derive a new calibration. These tasks are performed by the following functions:
@@ -192,53 +204,83 @@ After extracting the data and corresponding image for a given file, some preproc
   **Returns:**  
   - `np.ndarray`: Boolean mask of the same shape as input, with `True` for detected source pixels.
 
-- **`correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask, type1_pixels, v, plot_flag, source, ct, logger, shifter_value, loc, axis=None)`**  
-  Applies pre-calculated correction coefficients to an image using a Gaussian Mixture Model for Type II/III pixels and a random forest model for Type I pixels.
+- **`simth_t1_corr(image_file, ct, simth_file, type_1_mask, full_mask, th_mask, lc_mask, lc_on, logger, loc, plot_flag, axis=None)`**  
+  Performs calibration-based Type I cross-talk correction using a SimTh frame.
+
+  The function estimates the Type I cross-talk signal by removing the background from a mean-combined SimTh image. The extracted Type I signal is then subtracted from the cross-talk quadrant only at pixels identified as Type I.
 
   **Args:**  
-  - `image_file (str)`: Path of the image.  
-  - `mjd_input (int)`: MJD corresponding to calibration row.  
-  - `CFs (np.ndarray)`: 2D array of calibration factors.  
-  - `mjd_row (int)`: Row index of calibration.  
-  - `final_mask (np.ndarray)`: Mask indicating areas for correction.  
-  - `type1_pixels (np.ndarray)`: Mask for Type I pixels.  
-  - `v (bool)`: Verbose logging flag.  
-  - `plot_flag (bool)`: Flag to generate diagnostic plots.  
-  - `source (np.ndarray)`: Source quadrant pixel data.  
-  - `ct (np.ndarray)`: Target quadrant pixel data.  
-  - `logger (logging.Logger)`: Logger instance.  
-  - `shifter_value (float)`: Pixel shift to background noise level.  
-  - `loc (str)`: Location key for calibration.  
-  - `axis (int, optional)`: Axis for flipping; default `None`.
+  - `image_file (str)`: Path to the FITS image being processed.  
+  - `ct (np.ndarray)`: Cross-talk quadrant to be corrected.  
+  - `simth_file (np.ndarray)`: Mean-combined SimTh image used to estimate the Type I cross-talk signal.  
+  - `type_1_mask (np.ndarray)`: Binary mask identifying Type I cross-talk pixels.  
+  - `full_mask (np.ndarray)`: Complete source mask used to identify cross-talk regions.  
+  - `th_mask (np.ndarray)`: Threshold-based source mask.  
+  - `lc_mask (np.ndarray)`: Machine-learning source mask.  
+  - `lc_on (bool)`: If `True`, both the machine-learning and threshold masks are used to identify background pixels. Otherwise, only the threshold mask is used.  
+  - `logger (logging.Logger)`: Logger used to record processing information and errors.  
+  - `loc (str)`: Identifier of the quadrant pair being corrected.  
+  - `plot_flag (bool)`: If `True`, generates diagnostic images of the background estimation and extracted Type I signal.  
+  - `axis (int, optional)`: Axis used when flipping the source mask to align it with the cross-talk quadrant.
 
   **Returns:**  
-  - `ct_corrected (np.ndarray)`: Corrected image data.  
-  - `combined_mask (np.ndarray)`: Array indicating pixel types 0 (unaffected), 1 (Type I), 2 (Type II/III).
+  - `np.ndarray`: Cross-talk quadrant after applying the calibration-based Type I correction.
 
-- **`get_correction(image_file, final_mask, type1_pixels, source, ct, shifter_value, m2, c2, m3, c3, plot_flag, v, th_mask, lc_mask, lc_on, logger, loc, axis=None)`**  
-  Calculates correction coefficients for all spectra by identifying Type II/III pixels, fitting models, and returning best-fit slopes and intercepts.
+- **`correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask, v, plot_flag, source, ct, logger, th_mask, lc_mask, lc_on, simth_file, shifter_value, loc, axis=None)`**  
+  Applies inter-quadrant cross-talk correction using pre-determined calibration coefficients.
+
+  The function corrects cross-talk pixels by applying the appropriate correction model for the specified quadrant pair. Type I pixels are corrected using either the default trend-based method or a calibration-based method when a SimTh frame is provided. Type II and Type III pixels are corrected using the supplied calibration coefficients.
 
   **Args:**  
-  - `image_file (str)`: Path to FITS image.  
-  - `final_mask (np.ndarray)`: Mask for cross-talk-affected pixels.  
-  - `type1_pixels (np.ndarray)`: Mask for Type I pixels.  
-  - `source (np.ndarray)`: Source quadrant pixels.  
-  - `ct (np.ndarray)`: Target quadrant pixels.  
-  - `shifter_value (float)`: Additional correction shift.  
-  - `m2, c2 (float)`: Initial slope/intercept for Type II.  
-  - `m3, c3 (float)`: Initial slope/intercept for Type III.  
-  - `plot_flag (bool)`: Flag to generate diagnostic plots.  
-  - `v (bool)`: Verbose logging flag.  
-  - `th_mask (np.ndarray)`: Thorium mask.  
-  - `lc_mask (np.ndarray)`: Laser comb mask.  
-  - `lc_on (bool)`: Whether `lc_mask` is applied.  
-  - `logger (logging.Logger)`: Logger instance.  
-  - `loc (str)`: Quadrant location string.  
-  - `axis (int, optional)`: Axis for flipping; default `None`.
+  - `image_file (str)`: Path to the FITS image being processed.  
+  - `mjd_input (int or float)`: Modified Julian Date (MJD) of the observation.  
+  - `CFs (np.ndarray)`: Array containing the calibration coefficients for all supported MJD ranges.  
+  - `mjd_row (int)`: Index of the row in `CFs` corresponding to the selected MJD.  
+  - `final_mask (np.ndarray)`: Pixel classification mask identifying the cross-talk pixel types.  
+  - `v (bool)`: Enables verbose logging.  
+  - `plot_flag (bool)`: Enables diagnostic plots.  
+  - `source (np.ndarray)`: Source quadrant contributing the cross-talk signal.  
+  - `ct (np.ndarray)`: Cross-talk quadrant to be corrected.  
+  - `logger (logging.Logger)`: Logger used to record processing information.  
+  - `th_mask (np.ndarray)`: Threshold-based mask identifying saturated source pixels.  
+  - `lc_mask (np.ndarray)`: Machine-learning source mask.  
+  - `lc_on (bool)`: If `True`, uses the machine-learning mask; otherwise, only the threshold mask is used.  
+  - `simth_file (np.ndarray or None)`: Mean-combined SimTh image used for calibration-based Type I correction. If `None`, the trend-based correction is applied.  
+  - `shifter_value (float)`: Offset applied to the correction model where required.  
+  - `loc (str)`: Identifier of the quadrant pair being corrected (e.g. `"q4_q1"`).  
+  - `axis (int, optional)`: Axis along which the arrays are flipped before or after correction, depending on the quadrant orientation.
 
   **Returns:**  
-  - `ct_corrected (np.ndarray)`: Corrected image data.  
-  - `combined_mask (np.ndarray)`: Array indicating pixel types.
+  - `np.ndarray`: Corrected cross-talk quadrant.
+
+- **`get_correction(image_file, final_mask, shifter_value, m2, c2, m3, c3, v, plot_flag, source, ct, logger, th_mask, lc_mask, lc_on, simth_file, loc, axis=None)`**  
+  Applies Type I, Type II, and Type III cross-talk corrections to a single quadrant using the supplied calibration coefficients.
+
+  The function first estimates and removes the local background from the cross-talk quadrant before applying linear correction models to Type II and Type III pixels. Type I pixels are then corrected using either the default trend-based method or the calibration-based SimTh method, depending on whether a SimTh frame is provided.
+
+  **Args:**  
+  - `image_file (str)`: Path to the FITS image being processed.  
+  - `final_mask (np.ndarray)`: Pixel classification mask containing the identified cross-talk pixel types.  
+  - `shifter_value (float)`: Offset used by the trend-based Type I correction.  
+  - `m2 (float)`: Initial slope for the Type II correction model.  
+  - `c2 (float)`: Initial intercept for the Type II correction model.  
+  - `m3 (float)`: Initial slope for the Type III correction model.  
+  - `c3 (float)`: Initial intercept for the Type III correction model.  
+  - `v (bool)`: Enables verbose logging.  
+  - `plot_flag (bool)`: Enables generation of diagnostic plots.  
+  - `source (np.ndarray)`: Source quadrant responsible for the cross-talk signal.  
+  - `ct (np.ndarray)`: Cross-talk quadrant to be corrected.  
+  - `logger (logging.Logger)`: Logger used to record processing information.  
+  - `th_mask (np.ndarray)`: Threshold-based source mask.  
+  - `lc_mask (np.ndarray)`: Machine-learning source mask.  
+  - `lc_on (bool)`: If `True`, the machine-learning mask is used together with the threshold mask when estimating the background.  
+  - `simth_file (np.ndarray or None)`: Mean-combined SimTh image used for calibration-based Type I correction. If `None`, the default trend-based correction is applied.  
+  - `loc (str)`: Identifier of the quadrant pair being corrected.  
+  - `axis (int, optional)`: Axis used when flipping arrays to align the source and cross-talk quadrants.
+
+  **Returns:**  
+  - `np.ndarray`: Cross-talk quadrant after applying all applicable Type I, Type II, and Type III corrections.  
+  - `np.ndarray`: Pixel classification mask aligned with the returned corrected quadrant.
 
 - **`linear_fit(x, y, m=None, c=None)`**  
   Performs linear regression with optional fixed slope (`m`) and/or intercept (`c`). Uses `sklearn` and `scipy` for fitting and uncertainty estimation.
@@ -263,9 +305,6 @@ After extracting the data and corresponding image for a given file, some preproc
   **Returns:**  
   - `dict`: Fitting results for both Type II and III data.
 
-## Correction
-Once all locations requiring correction have been identified and the corresponding correction values determined, the script uses the following functions—one for Type I pixels, and another for Type II and III pixels:
-
 - **`apply_random_forest_with_bounding_boxes(loc_data, ct, shifter_value, bounding_boxes, threshold=160)`**  
   Applies a random forest model to detrend data within specified locations, smooths predictions using Lowess smoothing, and adjusts values based on a threshold to match the background level.
 
@@ -278,3 +317,30 @@ Once all locations requiring correction have been identified and the correspondi
 
   **Returns:**  
   - `np.ndarray`: Quadrant with corrected Type I cross-talk.
+
+## Random Forest Classifier
+
+- **`extract_features(img, coords)`**
+  Extracts feature vectors for image pixels to be used by the machine-learning source mask classifier. For each pixel, the extracted features include the pixel intensity, local intensity gradients, local 3×3 standard deviation, and the normalised pixel coordinates.
+
+  **Args:**
+
+  - `img (np.ndarray)`: 2D detector image.
+  - `coords (np.ndarray)`: Array of pixel coordinates with shape (N, 2), where each row contains the (row, column) index of a pixel.
+
+  **Returns:**
+
+  - `np.ndarray`: Feature matrix of shape (N, M), where each row contains the extracted features for a single pixel.
+  
+- **`type_mask(img, mask, model)`**
+  Classifies candidate source pixels into cross-talk types using a trained machine-learning model. Pixels above the detector saturation threshold are automatically classified as Type I sources. Remaining candidate pixels within the input mask are classified using the supplied machine-learning model.
+
+  **Args:**
+
+  - `img (np.ndarray):` 2D detector image.
+  - `mask (np.ndarray):` Binary mask identifying candidate source pixels to classify. Only non-zero pixels are processed by the model.
+  - `model (sklearn.base.BaseEstimator):` Trained machine-learning classifier used to distinguish source pixel types.
+  
+  **Returns:**
+  
+  - `np.ndarray`: Integer mask with the same shape as img, containing the predicted source classifications.
