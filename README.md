@@ -4,6 +4,47 @@ Inter-quadrant Cross-talk Correction
 Documentation  
 https://github.com/priyashmistry/vcrosst/blob/main/Documentation.md
 
+# Random Forest Classifier Models
+
+The trained Random Forest classifier models, along with the files used to train them, can be downloaded from the following SharePoint folder:
+
+**Training Models and Data:**
+https://unsw-my.sharepoint.com/:f:/g/personal/z5517274_ad_unsw_edu_au/IgBQx-ykQw22TrWx9BS7u8bvAbQzK8heIA741i7Sh2cByNg?e=8cJAIy
+
+## Installation
+
+Download the following model files:
+
+```text
+model_Q1.pkl
+model_Q2.pkl
+```
+
+Copy both files into:
+
+```text
+VeloceDR/cal_files/
+```
+
+## Directory Structure
+
+Ensure that the `VeloceDR` directory is located in the same parent directory as the `vcrosst` executable/script.
+
+```text
+parent_directory/
+├── vcrosst
+└── VeloceDR/
+    └── cal_files/
+        ├── model_Q1.pkl
+        └── model_Q2.pkl
+```
+
+## Notes
+
+* Both `model_Q1.pkl` and `model_Q2.pkl` are required for the cross-talk correction pipeline.
+* The models must be placed in `VeloceDR/cal_files/` before running `vcrosst`.
+* If the models are not found in the expected location, the classifier-based pixel classification step will fail.
+
 # Installation
 
 ## Mac Installation
