@@ -233,6 +233,26 @@ def load_fits_image(file_path, logger):
         logger.error(f"{THIS} Failed to load FITS file '{file_path}': {e}")
         raise
         
+def get_type1_threshold(header, quadrant, user_threshold=None):
+    """Read the source quadrant's saturation threshold from this exposure."""
+    if user_threshold is not None:
+        raise ValueError(
+            "--type1_threshold is no longer supported. "
+            "Type I thresholds must come from the FITS header."
+        )
+
+    key = f"VQ{quadrant}SAT"
+
+    if key not in header:
+        raise KeyError(f"Missing required saturation keyword: {key}")
+
+    threshold = float(header[key]) - 150.0
+
+    if not np.isfinite(threshold) or threshold <= 0:
+        raise ValueError(f"Invalid {key}: {header[key]}")
+
+    return threshold
+        
 def save_multi_extension_fits(corrected_data, mask_data, save_path, logger):
     """
     Save two arrays into a multi-extension FITS file.
@@ -573,6 +593,7 @@ def process_files_in_batches(files, args, logger, log_dir=None):
                     args.cal,
                     args.mask1_threshold,
                     args.mask2_threshold,
+                    args.type1_threshold,
                     args.q4_q1_cfs,
                     args.q4_q2_cfs,
                     args.q3_q2_cfs,
@@ -626,7 +647,7 @@ def get_source_mask(array, lower_lim, sat_lim, size_lim = 50):
     """
     
     # Step 1: Select pixels greater than given sat_lim
-    type1_pixels = array > sat_lim
+    type1_pixels = np.isfinite(array) & (array >= sat_lim)
     
     # Step 2: Find connected regions
     structure = generate_binary_structure(2, 1)
@@ -979,7 +1000,7 @@ def get_correction(image_file, final_mask, shifter_value, m2, c2, m3, c3, v, plo
             plt.grid(False)
             plt.savefig(
                 str(image_file[-16:]) + "_bg_rm_" + str(loc) + ".png",
-                dpi=100,
+                dpi=600,
                 format="png",
                 bbox_inches="tight"
             )
@@ -1005,7 +1026,7 @@ def get_correction(image_file, final_mask, shifter_value, m2, c2, m3, c3, v, plo
             plt.grid(False)
             plt.savefig(
                 str(image_file[-16:]) + "_bg_" + str(loc) + ".png",
-                dpi=100,
+                dpi=600,
                 format="png",
                 bbox_inches="tight"
             )
@@ -1030,7 +1051,7 @@ def get_correction(image_file, final_mask, shifter_value, m2, c2, m3, c3, v, plo
             plt.grid(False)
             plt.savefig(
                 str(image_file[-16:]) + "_bg_corr_ct_q_" + str(loc) + ".png",
-                dpi=100,
+                dpi=600,
                 format="png",
                 bbox_inches="tight"
             )
@@ -1127,7 +1148,7 @@ def get_correction(image_file, final_mask, shifter_value, m2, c2, m3, c3, v, plo
                 #plt.legend()
 
                 plt.savefig(f"{image_file[-16:]}_CFs_{loc}.png",
-                            dpi=100, format="png", bbox_inches='tight')
+                            dpi=600, format="png", bbox_inches='tight')
 
                 plt.show()
                 plt.close()
@@ -1465,7 +1486,7 @@ def simth_t1_corr(image_file, ct, simth_file, type_1_mask, full_mask,
             plt.grid(False)
             plt.savefig(
                 str(image_file[-16:]) + "_bg_rm_" + str(loc) + ".png",
-                dpi=100,
+                dpi=600,
                 format="png",
                 bbox_inches='tight'
             )
@@ -1495,7 +1516,7 @@ def simth_t1_corr(image_file, ct, simth_file, type_1_mask, full_mask,
             plt.grid(False)
             plt.savefig(
                 str(image_file[-16:]) + "_bg_" + str(loc) + ".png",
-                dpi=100,
+                dpi=600,
                 format="png",
                 bbox_inches='tight'
             )
@@ -1510,7 +1531,7 @@ def simth_t1_corr(image_file, ct, simth_file, type_1_mask, full_mask,
             plt.grid(False)
             plt.savefig(
             str(image_file[-16:]) + "_bg_sub_" + str(loc) + ".png",
-            dpi=100,
+            dpi=600,
             format="png",
             bbox_inches='tight'
             )
@@ -1668,28 +1689,84 @@ def correction_using_known_cfs(image_file, mjd_input, CFs, mjd_row, final_mask, 
         if plot_flag:
 
             try:
-                plt.figure(figsize=(12, 8))
-                
-                plt.scatter(t2_source, t2_ct, color='red', label='Type II', alpha = 0.6)
-                plt.plot(t2_source, y_pred_t2, color='red',
-                         label=f'Best Fit (Type II): y = {m_2:.6f}x + {c_2:.2f}')
-                
-                plt.scatter(t3_source, t3_ct, color='blue', label='Type III', alpha = 0.6)
-                plt.plot(t3_source, y_pred_t3, color='blue',
-                         label=f'Best Fit (Type III): y = {m_3:.6f}x + {c_3:.2f}')
+                        # Plotting
 
-                plt.grid(True)
-                
-                plt.xlabel('Source Pixels')
-                plt.ylabel('Cross-talk Pixels')
-                #plt.title(f'Fit with GMM Separation [{image_file[-16:]}]')
-                plt.legend()
+                # Publication-style font sizes
+                plt.rcParams.update({
+                    'font.size': 15,
+                    'axes.labelsize': 15,
+                    'xtick.labelsize': 15,
+                    'ytick.labelsize': 15,
+                    'legend.fontsize': 15,
+                })
 
-                plt.savefig(f"{image_file[-16:]}_CFs_{loc}.png",
-                            dpi=100, format="png", bbox_inches='tight')
+                # Suitable for approximately double-column journal width
+                plt.figure(figsize=(10, 6))
+
+
+                # Plot Type II
+                plt.scatter(
+                    t2_source,
+                    t2_ct,
+                    color='red',
+                    label='Type II',
+                    alpha=0.6,
+                    s=12
+                )
+
+                plt.plot(
+                    t2_source,
+                    y_pred_t2,
+                    color='red',
+                    linewidth=1.5,
+                    label=f'Best Fit (Type II): $y = {m_2:.6f}x + {c_2:.2f}$'
+                )
+
+
+                # Plot Type III
+                plt.scatter(
+                    t3_source,
+                    t3_ct,
+                    color='blue',
+                    label='Type III',
+                    alpha=0.6,
+                    s=12
+                )
+
+                plt.plot(
+                    t3_source,
+                    y_pred_t3,
+                    color='blue',
+                    linewidth=1.5,
+                    label=f'Best Fit (Type III): $y = {m_3:.6f}x + {c_3:.2f}$'
+                )
+
+                # Axis labels
+                plt.xlabel('Source Pixel Signal (ADU)', fontsize=13)
+                plt.ylabel('Cross-talk Pixel Signal (ADU)', fontsize=13)
+
+                # Tick labels
+                plt.tick_params(
+                    axis='both',
+                    which='major',
+                    labelsize=13
+                )
+
+                # Legend
+                plt.legend(
+                    fontsize=13,
+                )
+
+                plt.tight_layout()
+
+                plt.savefig(
+                    str(image_file[-16:]) + "_CFs_" + str(loc) + ".png",
+                    dpi=600,
+                    format="png",
+                    bbox_inches='tight'
+                )
 
                 plt.show()
-                plt.close()
 
             except Exception as e:
                 logger.error(f"{THIS}{e}", file=sys.stderr)
@@ -1801,67 +1878,30 @@ def extract_features(img, coords):
 # APPLY MODEL TO MASK
 # ===================================================
 
-def type_mask(img, mask, model):
-    
-    """
-    Classifies candidate source pixels using a trained machine-learning model.
+def type_mask(img, mask, model, sat_lim):
+    """Assign Type I by header threshold; classify the remaining candidates."""
+    if not np.array_equal(np.asarray(model.classes_), np.array([2, 3])):
+        raise ValueError(
+            "This model is not a Type II/III-only classifier. "
+            "Retrain it using the updated reference selection."
+        )
 
-    Pixels above the detector saturation threshold are automatically classified
-    as Type I sources. Remaining candidate pixels contained within the input
-    mask are classified by the supplied machine-learning model.
+    final_mask = np.zeros(img.shape, dtype=np.int16)
+    finite = np.isfinite(img)
 
-    Parameters
-    ----------
-    img : ndarray
-        Two-dimensional image array.
-    mask : ndarray
-        Candidate source mask. Only non-zero pixels are classified by the
-        machine-learning model.
-    model : sklearn.base.BaseEstimator
-        Trained classification model used to distinguish source pixel types.
-
-    Returns
-    -------
-    ndarray
-        Integer mask with the same shape as ``img`` containing the predicted
-        pixel classifications.
-
-    Notes
-    -----
-    Pixels with values greater than or equal to 62,500 counts are always
-    assigned to Type I without invoking the machine-learning classifier.
-    """
-
-    ny, nx = img.shape
-
-    final_mask = np.zeros((ny, nx), dtype=np.int16)
-
-    # ===================================================
-    # HARD SATURATION RULE
-    # ===================================================
-
-    final_mask[img >= 62500] = 1
-
-    # ===================================================
-    # ML REGION
-    # ===================================================
+    final_mask[finite & (img >= sat_lim)] = 1
 
     ml_region = (
-        (img < 62500) &
+        finite &
+        (img < sat_lim) &
         (mask != 0)
     )
 
     coords = np.argwhere(ml_region)
 
-    if len(coords) > 0:
-
-        X_test = extract_features(img, coords)
-
-        pred = model.predict(X_test)
-
-        for (j, i), p in zip(coords, pred):
-
-            final_mask[j, i] = p
+    if len(coords):
+        features = extract_features(img, coords)
+        final_mask[ml_region] = model.predict(features).astype(np.int16)
 
     return final_mask
 
@@ -1966,8 +2006,63 @@ def load_and_mean_fits(input_source, logger):
         np.stack(images),
         axis=0
     )
-    
-def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs, skip, image_file, simth_list=None, retrain_model=False, log_dir=None):
+
+def load_training_reference(mask_file, CFs):
+    original_file = mask_file[:-len("oc.fits")] + "o.fits"
+
+    with fits.open(original_file) as hdul:
+        image = np.asarray(hdul[0].data, dtype=float).copy()
+        header = hdul[0].header.copy()
+
+    with fits.open(mask_file) as hdul:
+        if len(hdul) < 2:
+            raise ValueError(f"No reference mask in {mask_file}")
+
+        ct_mask = np.asarray(hdul[1].data).copy()
+
+    if image.shape != (4112, 4202) or ct_mask.shape != image.shape:
+        raise ValueError(f"Unexpected image/mask dimensions: {mask_file}")
+
+    mjd = float(header["UTMJD"])
+    matches = np.flatnonzero(
+        (mjd >= CFs[:, 2]) & (mjd <= CFs[:, 3])
+    )
+
+    modes = np.unique(CFs[matches, 1])
+
+    if len(modes) != 1:
+        raise ValueError(
+            f"Cannot determine an unambiguous readout mode for {mask_file}"
+        )
+
+    amp = int(modes[0])
+
+    if amp not in (2, 4):
+        raise ValueError(f"Unsupported readout mode: {amp}")
+
+    q3_mask = ct_mask[0:2056, 2101:4202].copy()
+    q4_mask = ct_mask[2056:4112, 2101:4202].copy()
+
+    if amp == 4:
+        # Q3 contains Q2-origin labels. Map their footprint into Q4
+        # and exclude potential mixed/overwritten reference labels.
+        q2_in_q4 = np.flipud(np.isin(q3_mask, [1, 2, 3]))
+        q4_mask[q2_in_q4] = 0
+
+    source_labels = {
+        "Q1": np.fliplr(q4_mask).copy(),
+        "Q2": np.fliplr(q3_mask).copy(),
+    }
+
+    thresholds = {
+        "Q1": get_type1_threshold(header, 1),
+        "Q2": get_type1_threshold(header, 2),
+    }
+
+    return image, source_labels, thresholds
+
+
+def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, type1_threshold, q4_q1_cfs, q4_q2_cfs, q3_q2_cfs, q3_q1_cfs, q2_q1_cfs, q1_q2_cfs, skip, image_file, simth_list=None, retrain_model=False, log_dir=None):
     
     """
     Processes a single Veloce FITS image by identifying inter-quadrant cross-talk
@@ -2048,6 +2143,74 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
 
     """
 
+    CFs = np.array([
+        [2018, 4, 58378.6, 58387.9, 0.00E+00, 3.22E-04, 2.90E-05, 94.91, 1.14E+00, 4.54E-04, 2.47E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 85.75, 9.02E-01, 3.11E-05, 1.06E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+        
+        [2018, 4, 58437.0, 58449.5, 0.00E+00, 3.22E-04, 2.90E-05, 122.19, 4.40E-01, 7.25E-04, 1.29E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 81.13, 9.91E-01, 2.12E-04, 7.54E-05, 0.00E+00, 0.00E+00, 0.00E+00, 1.66E-04, 9.76E-05, 80.79, 1.68E+00, 6.32E-04, 5.72E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58504.3, 58517.9, 0.00E+00, 3.22E-04, 2.90E-05, 120.3, 4.16E-01, 7.26E-04, 1.07E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 80.89, 4.78E-01, 1.42E-04, 7.34E-05, 0.00E+00, 0.00E+00, 0.00E+00, 9.42E-06, 1.06E-04, 82.57, 2.12E+00, 6.10E-04, 6.60E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58581.4, 58585.9, 0.00E+00, 3.22E-04, 2.90E-05, 92.11, 6.66E-01, 4.85E-04, 9.45E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 84.89, 9.69E-01, 7.31E-05, 1.39E-05, 0.00E+00, 0.00E+00, 0.00E+00, 2.23E-04, 8.70E-05, 62.50, 7.71E-01, 4.33E-04, 1.65E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58585.9, 58588.9, 0.00E+00, 3.22E-04, 2.90E-05, 88.76, 2.27E-01, 4.74E-04, 5.60E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 83.11, 3.17E-01, 7.75E-05, 1.29E-05, 0.00E+00, 0.00E+00, 0.00E+00, 3.19E-04, 6.73E-05, 58.91, 4.46E-01, 4.19E-04, 1.27E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58588.9, 58608.9, 0.00E+00, 3.22E-04, 2.90E-05, 91.63, 2.32E-01, 5.13E-04, 1.12E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 80.75, 3.07E+00, 6.80E-05, 6.61E-05, 0.00E+00, 0.00E+00, 0.00E+00, 8.92E-05, 7.77E-05, 64.02, 8.97E-01, 4.36E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58608.9, 58610.9, 0.00E+00, 3.22E-04, 2.90E-05, 92.53, 2.93E-01, 5.00E-04, 1.39E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 85.88, 3.91E-01, 9.59E-05, 1.62E-05, 0.00E+00, 0.00E+00, 0.00E+00, 1.20E-04, 1.04E-04, 62.50, 9.55E-01, 4.43E-04, 2.34E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58610.9, 58615.9, 0.00E+00, 3.22E-04, 2.90E-05, 90.58, 7.83E-01, 5.07E-04, 9.90E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 79.56, 2.06E+00, 9.09E-05, 4.80E-05, 0.00E+00, 0.00E+00, 0.00E+00, 5.98E-05, 6.21E-05, 62.25, 7.43E-01, 4.44E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58620.2, 58620.8, 0.00E+00, 3.22E-04, 2.90E-05, 124.72, 4.44E-01, 7.85E-04, 1.33E-04, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 74.22, 1.76E+00, 4.06E-05, 4.68E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 83.14, 1.96E+00, 6.53E-04, 1.35E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58620.8, 58621.9, 0.00E+00, 3.22E-04, 2.90E-05, 119.47, 1.88E-01, 7.51E-04, 5.02E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 74.2, 1.39E+00, 3.79E-05, 9.21E-06, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 81.10, 3.46E-01, 6.11E-04, 8.28E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58621.9, 58634.9, 0.00E+00, 3.22E-04, 2.90E-05, 124.59, 5.33E-01, 7.79E-04, 7.23E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 77.24, 3.17E+00, 4.77E-05, 3.74E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 83.79, 5.50E-01, 6.41E-04, 8.61E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58634.9, 58636.3, 0.00E+00, 3.22E-04, 2.90E-05, 120.1, 5.57E-01, 7.62E-04, 4.14E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 76.56, 1.28E+00, 4.56E-05, 1.65E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 80.47, 8.19E-01, 6.08E-04, 6.40E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58636.3, 58659.9, 0.00E+00, 3.22E-04, 2.90E-05, 125.44, 4.43E-01, 7.94E-04, 1.44E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 77.24, 2.16E+00, 4.67E-05, 3.22E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 82.30, 1.07E+00, 6.44E-04, 5.23E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 4, 58659.9, 58714.7, 0.00E+00, 3.22E-04, 2.90E-05, 122.07, 4.96E-01, 7.77E-04, 2.80E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 79.24, 1.81E+00, 8.40E-05, 5.56E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 81.41, 2.05E+00, 6.22E-04, 7.41E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 2, 58715.8, 58736.4, 0.00E+00, 3.22E-04, 2.90E-05, 121.16, 1.73E+00, 7.52E-04, 4.99E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 2, 58736.4, 58745.9, 0.00E+00, 3.22E-04, 2.90E-05, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 2, 58755.3, 58792.8, 0.00E+00, 3.22E-04, 2.90E-05, 110.48, 8.29E-01, 7.66E-04, 1.41E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.46E-04, 1.79E-05, 109.71, 8.86E-01, 7.63E-04, 1.48E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2019, 2, 58792.8, 58848.8, 0.00E+00, 3.22E-04, 2.90E-05, 107.98, 3.82E-01, 7.35E-04, 1.01E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.33E-04, 1.63E-05, 107.32, 7.46E-01, 7.28E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 2, 58849.2, 58889.7, 0.00E+00, 3.22E-04, 2.90E-05, 106.01, 7.21E-01, 7.18E-04, 1.03E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.24E-04, 9.02E-06, 105.64, 6.72E-01, 7.03E-04, 9.34E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 2, 58912.2, 58931.8, 0.00E+00, -1.98E-04, 2.41E-04, 75.04, 3.29E-01, 6.40E-04, 2.68E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 82.73, 5.02E-01, 6.37E-04, 6.20E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 2, 58931.8, 59037.9, 0.00E+00, -1.98E-04, 2.41E-04, 71.45, 6.90E-01, 7.28E-04, 4.90E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 77.92, 8.29E-01, 6.51E-04, 5.09E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 4, 59072.2, 59084.9, 0.00E+00, 3.22E-04, 2.90E-05, 112.34, 6.35E-01, 7.81E-04, 3.17E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 78.8, 9.84E-01, 1.37E-04, 3.17E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 80.09, 9.66E-01, 5.45E-04, 3.08E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 4, 59084.9, 59177.3, 0.00E+00, 3.22E-04, 2.90E-05, 110.77, 7.52E-01, 7.11E-04, 1.90E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.4, 8.08E-01, 7.28E-05, 3.03E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 82.45, 4.68E-01, 5.85E-04, 1.31E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 2, 59178.2, 59179.8, 0.00E+00, 3.22E-04, 2.90E-05, 74.75, 8.44E-02, 6.52E-04, 9.47E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 83.46, 8.66E-02, 5.89E-04, 6.55E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2020, 4, 59205.2, 59213.8, 0.00E+00, 3.22E-04, 2.90E-05, 103.01, 7.29E-01, 6.87E-04, 3.36E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.36, 1.09E+00, 9.19E-05, 2.67E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 83.16, 2.02E-01, 6.09E-04, 1.42E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 4, 59265.3, 59280.9, 0.00E+00, 3.22E-04, 2.90E-05, 101.9964547, 6.23E-01, 6.76E-04, 1.43E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.65, 9.18E-01, 9.28E-05, 5.36E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 83.32, 6.04E-01, 5.99E-04, 1.62E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 4, 59280.9, 59455.9, 0.00E+00, 3.22E-04, 2.90E-05, 105.1650902, 8.33E-01, 7.16E-04, 1.55E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 74.66, 6.65E-01, 1.08E-04, 5.77E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 81.35, 6.42E-01, 6.28E-04, 2.14E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 2, 59456.2, 59512.8, 0.00E+00, 3.22E-04, 2.90E-05, 102.7105457, 1.03E+00, 6.78E-04, 1.39E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.49E-04, 1.73E-05, 101.51, 9.13E-01, 6.81E-04, 1.31E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 2, 59512.8, 59534.8, 0.00E+00, 3.22E-04, 2.90E-05, 99.96277008, 3.37E-01, 6.51E-04, 5.09E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.33E-04, 1.09E-05, 99.61, 4.84E-01, 6.56E-04, 9.48E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2021, 2, 59534.8, 59536.7, 0.00E+00, 3.22E-04, 2.90E-05, 96.29001932, 1.87E+00, 6.32E-04, 1.54E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.42E-04, 1.84E-05, 95.12, 1.72E+00, 6.31E-04, 1.22E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2022, 2, 59745.0, 59751.8, 0.00E+00, -1.34E-03, 0.06E-03, 89.07, 4.14E-01, 1.86E-04, 3.38E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 86.37, 3.34E-01, 3.59E-05, 1.99E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2022, 2, 59801.3, 59809.2, 0.00E+00, -1.34E-03, 0.06E-03, 82.99, 4.59E-01, -2.73E-05, 3.28E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 81.59, 6.54E-01, -1.75E-04, 2.11E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
+
+        [2022, 2, 59821.2, 59926.5, 0.00E+00, -1.34E-03, 0.06E-03, 79.46, 3.08E-01, -1.13E-04, 3.83E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 78.79, 6.14E-01, -3.16E-04, 2.66E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan]
+])
+    
     try:
         pid = os.getpid()
         log_file = os.path.join(log_dir, f"log_{pid}_{os.path.basename(image_file)}.log")
@@ -2059,6 +2222,18 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
 
         # Load the image data
         image_data = load_fits_image(image_file, logger)
+        
+        header = fits.getheader(image_file, ext=0)
+
+        q1_type1_threshold = get_type1_threshold(header, quadrant=1, user_threshold=type1_threshold)
+
+        q2_type1_threshold = get_type1_threshold(header, quadrant=2, user_threshold=type1_threshold)
+
+        logger.info(
+            f"{THIS} Type-I thresholds: "
+            f"Q1={q1_type1_threshold:.4f} ADU, "
+            f"Q2={q2_type1_threshold:.4f} ADU"
+        )
         
         if simth_list is not None:
             simth_file = load_and_mean_fits(
@@ -2119,9 +2294,14 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
                 "mask_sample"
             )
 
-            train_files = glob.glob(
-                os.path.join(train_folder, "*oc.fits")
+            all_reference_files = sorted(
+                glob.glob(os.path.join(train_folder, "*oc.fits"))
             )
+
+            if len(all_reference_files) < 2:
+                raise ValueError("At least two reference exposures are required.")
+
+            train_files = all_reference_files
 
             # Storage for each quadrant
             X_data = {k: [] for k in QUADRANTS}
@@ -2137,24 +2317,34 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
                 unit="file"
             ):
 
-                try:
-
-                    with fits.open(f) as hdul:
-
-                        if len(hdul) < 2:
-                            continue
-
-                        full_img = hdul[0].data
-                        full_mask = np.fliplr(hdul[1].data)
+                    try:
+                        full_img, source_labels, sat_by_q = load_training_reference(
+                            f, CFs
+                        )
 
                         for name, (ys, xs) in QUADRANTS.items():
-
                             img = full_img[ys, xs]
-                            mask = full_mask[ys, xs]
+                            mask = source_labels[name]
+                            sat = sat_by_q[name]
+
+                            old_type1 = (
+                                np.isfinite(img) &
+                                (img < sat) &
+                                (mask == 1)
+                            )
+
+                            if np.any(old_type1):
+                                logger.warning(
+                                    f"{name}: excluding {np.count_nonzero(old_type1)} "
+                                    f"Type I reference labels below the header threshold "
+                                    f"in {os.path.basename(f)}. "
+                                    "These require fresh calibration classification."
+                                )
 
                             valid = (
-                                (img < 62500) &
-                                (mask != 0)
+                                np.isfinite(img) &
+                                (img < sat) &
+                                np.isin(mask, [2, 3])
                             )
 
                             coords = np.argwhere(valid)
@@ -2162,17 +2352,12 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
                             if len(coords) == 0:
                                 continue
 
-                            X_data[name].append(
-                                extract_features(img, coords)
-                            )
+                            X_data[name].append(extract_features(img, coords))
+                            y_data[name].append(mask[valid].astype(np.int16))
 
-                            y_data[name].append(
-                                mask[valid]
-                            )
-
-                except Exception as e:
-
-                    logger.error(f"{THIS} Skipping {f}: {e}")
+                    except Exception:
+                        logger.exception(f"Failed to load training reference: {f}")
+                        raise
 
             # ======================================================
             # TRAIN ONE MODEL PER QUADRANT
@@ -2184,11 +2369,16 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
 
                 X_train = np.vstack(X_data[name])
                 y_train = np.hstack(y_data[name])
+                
+                if not np.array_equal(np.unique(y_train), np.array([2, 3])):
+                    raise ValueError(
+                        f"{name}: training requires both Type II and Type III labels only."
+                    )
 
                 logger.info(
-                    f"{THIS}{name}: "
-                    f"{THIS}{X_train.shape[0]:,} samples, "
-                    f"{THIS}{X_train.shape[1]} features"
+                    f"{THIS}{ name}: "
+                    f"{X_train.shape[0]:,} samples, "
+                    f"{X_train.shape[1]} features"
                 )
 
                 Xtr, Xte, ytr, yte = train_test_split(
@@ -2253,7 +2443,12 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
                 "x_position"
             ]
 
-            test_file = train_files[0]
+            test_file = train_files[0] #np.random.default_rng(42).choice(train_files)
+
+            test_image, test_source_labels, test_sat_by_q = (
+                load_training_reference(test_file, CFs)
+            )
+            
 
             for name, (ys, xs) in QUADRANTS.items():
 
@@ -2267,17 +2462,13 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
                 # Reload quadrant from test image
                 # -------------------------------------------
 
-                with fits.open(test_file) as hdul:
-
-                    img = hdul[0].data[ys, xs]
-
-                    true_mask = np.fliplr(
-                        hdul[1].data
-                    )[ys, xs]
+                img = test_image[ys, xs]
+                true_mask = test_source_labels[name].copy()
 
                 valid = (
-                    (img < 62500) &
-                    (true_mask != 0)
+                    np.isfinite(img) &
+                    (img < test_sat_by_q[name]) &
+                    np.isin(true_mask, [2, 3])
                 )
 
                 coords = np.argwhere(valid)
@@ -2315,7 +2506,7 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
                 )
 
                 logger.info(f"{THIS} Confusion Matrix:\n")
-                logger.info(THIS, cm)
+                logger.info(f"{THIS}, {cm}")
 
                 plt.figure(figsize=(6, 6))
 
@@ -2359,11 +2550,12 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
                 input_mask = (
                     true_mask != 0
                 ).astype(np.int16)
-
+                
                 pred_mask = type_mask(
                     img,
                     input_mask,
-                    model
+                    model,
+                    test_sat_by_q[name]
                 )
 
                 error_map = (
@@ -2438,7 +2630,8 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
             logger.info(f"{THIS} Done.")
 
     except Exception as e:
-        logger.error(f"{THIS}{e}", file=sys.stderr)
+        logger.error(f"{THIS}{e}")
+        raise
     
     
     try:
@@ -2448,13 +2641,14 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
             final_mask_1 = get_source_mask(
                 q1,
                 mask1_threshold,
-                sat_lim=62500
+                sat_lim=q1_type1_threshold
             )
 
             type_mask_1 = type_mask(
                 q1,
                 final_mask_1,
-                models["Q1"]
+                models["Q1"],
+                q1_type1_threshold
             )
 
             logger.info(
@@ -2467,13 +2661,14 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
             final_mask_2 = get_source_mask(
                 q2,
                 mask2_threshold,
-                sat_lim=62500
+                sat_lim=q2_type1_threshold
             )
 
             type_mask_2 = type_mask(
                 q2,
                 final_mask_2,
-                models["Q2"]
+                models["Q2"],
+                q2_type1_threshold
             )
 
             logger.info(
@@ -2518,74 +2713,6 @@ def process_file(plot_flag, l, v, cal, mask1_threshold, mask2_threshold, q4_q1_c
     * C & CE: Zero Point & Uncertainty
     * Qn_Qm: Cross-talk in Qn from Qm. e.g., Q4_Q1: Cross-talk in quadrant 4 from the source in quadrant 1.
     """
-    
-    CFs = np.array([
-        [2018, 4, 58378.6, 58387.9, 0.00E+00, 3.22E-04, 2.90E-05, 94.91, 1.14E+00, 4.54E-04, 2.47E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 85.75, 9.02E-01, 3.11E-05, 1.06E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-        
-        [2018, 4, 58437.0, 58449.5, 0.00E+00, 3.22E-04, 2.90E-05, 122.19, 4.40E-01, 7.25E-04, 1.29E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 81.13, 9.91E-01, 2.12E-04, 7.54E-05, 0.00E+00, 0.00E+00, 0.00E+00, 1.66E-04, 9.76E-05, 80.79, 1.68E+00, 6.32E-04, 5.72E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58504.3, 58517.9, 0.00E+00, 3.22E-04, 2.90E-05, 120.3, 4.16E-01, 7.26E-04, 1.07E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 80.89, 4.78E-01, 1.42E-04, 7.34E-05, 0.00E+00, 0.00E+00, 0.00E+00, 9.42E-06, 1.06E-04, 82.57, 2.12E+00, 6.10E-04, 6.60E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58581.4, 58585.9, 0.00E+00, 3.22E-04, 2.90E-05, 92.11, 6.66E-01, 4.85E-04, 9.45E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 84.89, 9.69E-01, 7.31E-05, 1.39E-05, 0.00E+00, 0.00E+00, 0.00E+00, 2.23E-04, 8.70E-05, 62.50, 7.71E-01, 4.33E-04, 1.65E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58585.9, 58588.9, 0.00E+00, 3.22E-04, 2.90E-05, 88.76, 2.27E-01, 4.74E-04, 5.60E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 83.11, 3.17E-01, 7.75E-05, 1.29E-05, 0.00E+00, 0.00E+00, 0.00E+00, 3.19E-04, 6.73E-05, 58.91, 4.46E-01, 4.19E-04, 1.27E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58588.9, 58608.9, 0.00E+00, 3.22E-04, 2.90E-05, 91.63, 2.32E-01, 5.13E-04, 1.12E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 80.75, 3.07E+00, 6.80E-05, 6.61E-05, 0.00E+00, 0.00E+00, 0.00E+00, 8.92E-05, 7.77E-05, 64.02, 8.97E-01, 4.36E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58608.9, 58610.9, 0.00E+00, 3.22E-04, 2.90E-05, 92.53, 2.93E-01, 5.00E-04, 1.39E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 85.88, 3.91E-01, 9.59E-05, 1.62E-05, 0.00E+00, 0.00E+00, 0.00E+00, 1.20E-04, 1.04E-04, 62.50, 9.55E-01, 4.43E-04, 2.34E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58610.9, 58615.9, 0.00E+00, 3.22E-04, 2.90E-05, 90.58, 7.83E-01, 5.07E-04, 9.90E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 79.56, 2.06E+00, 9.09E-05, 4.80E-05, 0.00E+00, 0.00E+00, 0.00E+00, 5.98E-05, 6.21E-05, 62.25, 7.43E-01, 4.44E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58620.2, 58620.8, 0.00E+00, 3.22E-04, 2.90E-05, 124.72, 4.44E-01, 7.85E-04, 1.33E-04, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 74.22, 1.76E+00, 4.06E-05, 4.68E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 83.14, 1.96E+00, 6.53E-04, 1.35E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58620.8, 58621.9, 0.00E+00, 3.22E-04, 2.90E-05, 119.47, 1.88E-01, 7.51E-04, 5.02E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 74.2, 1.39E+00, 3.79E-05, 9.21E-06, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 81.10, 3.46E-01, 6.11E-04, 8.28E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58621.9, 58634.9, 0.00E+00, 3.22E-04, 2.90E-05, 124.59, 5.33E-01, 7.79E-04, 7.23E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 77.24, 3.17E+00, 4.77E-05, 3.74E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 83.79, 5.50E-01, 6.41E-04, 8.61E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58634.9, 58636.3, 0.00E+00, 3.22E-04, 2.90E-05, 120.1, 5.57E-01, 7.62E-04, 4.14E-06, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 76.56, 1.28E+00, 4.56E-05, 1.65E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 80.47, 8.19E-01, 6.08E-04, 6.40E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58636.3, 58659.9, 0.00E+00, 3.22E-04, 2.90E-05, 125.44, 4.43E-01, 7.94E-04, 1.44E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 77.24, 2.16E+00, 4.67E-05, 3.22E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 82.30, 1.07E+00, 6.44E-04, 5.23E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 4, 58659.9, 58714.7, 0.00E+00, 3.22E-04, 2.90E-05, 122.07, 4.96E-01, 7.77E-04, 2.80E-05, 0.00E+00, 0.00E+00, 0.00E+00, -1.21E-04, 3.51E-04, 79.24, 1.81E+00, 8.40E-05, 5.56E-05, 0.00E+00, 0.00E+00, 0.00E+00, -5.83E-05, 1.43E-04, 81.41, 2.05E+00, 6.22E-04, 7.41E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 2, 58715.8, 58736.4, 0.00E+00, 3.22E-04, 2.90E-05, 121.16, 1.73E+00, 7.52E-04, 4.99E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 2, 58736.4, 58745.9, 0.00E+00, 3.22E-04, 2.90E-05, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 2, 58755.3, 58792.8, 0.00E+00, 3.22E-04, 2.90E-05, 110.48, 8.29E-01, 7.66E-04, 1.41E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.46E-04, 1.79E-05, 109.71, 8.86E-01, 7.63E-04, 1.48E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2019, 2, 58792.8, 58848.8, 0.00E+00, 3.22E-04, 2.90E-05, 107.98, 3.82E-01, 7.35E-04, 1.01E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.33E-04, 1.63E-05, 107.32, 7.46E-01, 7.28E-04, 1.33E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2020, 2, 58849.2, 58889.7, 0.00E+00, 3.22E-04, 2.90E-05, 106.01, 7.21E-01, 7.18E-04, 1.03E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.24E-04, 9.02E-06, 105.64, 6.72E-01, 7.03E-04, 9.34E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2020, 2, 58912.2, 58931.8, 0.00E+00, -1.98E-04, 2.41E-04, 75.04, 3.29E-01, 6.40E-04, 2.68E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 82.73, 5.02E-01, 6.37E-04, 6.20E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2020, 2, 58931.8, 59037.9, 0.00E+00, -1.98E-04, 2.41E-04, 71.45, 6.90E-01, 7.28E-04, 4.90E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 77.92, 8.29E-01, 6.51E-04, 5.09E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2020, 4, 59072.2, 59084.9, 0.00E+00, 3.22E-04, 2.90E-05, 112.34, 6.35E-01, 7.81E-04, 3.17E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 78.8, 9.84E-01, 1.37E-04, 3.17E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 80.09, 9.66E-01, 5.45E-04, 3.08E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2020, 4, 59084.9, 59177.3, 0.00E+00, 3.22E-04, 2.90E-05, 110.77, 7.52E-01, 7.11E-04, 1.90E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.4, 8.08E-01, 7.28E-05, 3.03E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 82.45, 4.68E-01, 5.85E-04, 1.31E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2020, 2, 59178.2, 59179.8, 0.00E+00, 3.22E-04, 2.90E-05, 74.75, 8.44E-02, 6.52E-04, 9.47E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -2.93E-04, 1.33E-04, 83.46, 8.66E-02, 5.89E-04, 6.55E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2020, 4, 59205.2, 59213.8, 0.00E+00, 3.22E-04, 2.90E-05, 103.01, 7.29E-01, 6.87E-04, 3.36E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.36, 1.09E+00, 9.19E-05, 2.67E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 83.16, 2.02E-01, 6.09E-04, 1.42E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2021, 4, 59265.3, 59280.9, 0.00E+00, 3.22E-04, 2.90E-05, 101.9964547, 6.23E-01, 6.76E-04, 1.43E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 79.65, 9.18E-01, 9.28E-05, 5.36E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 83.32, 6.04E-01, 5.99E-04, 1.62E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2021, 4, 59280.9, 59455.9, 0.00E+00, 3.22E-04, 2.90E-05, 105.1650902, 8.33E-01, 7.16E-04, 1.55E-05, 0.00E+00, 0.00E+00, 0.00E+00, -4.64E-04, 1.42E-04, 74.66, 6.65E-01, 1.08E-04, 5.77E-05, 0.00E+00, 0.00E+00, 0.00E+00, -2.93E-04, 1.33E-04, 81.35, 6.42E-01, 6.28E-04, 2.14E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2021, 2, 59456.2, 59512.8, 0.00E+00, 3.22E-04, 2.90E-05, 102.7105457, 1.03E+00, 6.78E-04, 1.39E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.49E-04, 1.73E-05, 101.51, 9.13E-01, 6.81E-04, 1.31E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2021, 2, 59512.8, 59534.8, 0.00E+00, 3.22E-04, 2.90E-05, 99.96277008, 3.37E-01, 6.51E-04, 5.09E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.33E-04, 1.09E-05, 99.61, 4.84E-01, 6.56E-04, 9.48E-06, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2021, 2, 59534.8, 59536.7, 0.00E+00, 3.22E-04, 2.90E-05, 96.29001932, 1.87E+00, 6.32E-04, 1.54E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, 3.42E-04, 1.84E-05, 95.12, 1.72E+00, 6.31E-04, 1.22E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2022, 2, 59745.0, 59751.8, 0.00E+00, -1.34E-03, 0.06E-03, 89.07, 4.14E-01, 1.86E-04, 3.38E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 86.37, 3.34E-01, 3.59E-05, 1.99E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2022, 2, 59801.3, 59809.2, 0.00E+00, -1.34E-03, 0.06E-03, 82.99, 4.59E-01, -2.73E-05, 3.28E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 81.59, 6.54E-01, -1.75E-04, 2.11E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan],
-
-        [2022, 2, 59821.2, 59926.5, 0.00E+00, -1.34E-03, 0.06E-03, 79.46, 3.08E-01, -1.13E-04, 3.83E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0.00E+00, -1.26E-03, 2.73E-04, 78.79, 6.14E-01, -3.16E-04, 2.66E-05, 0.00E+00, 0.00E+00, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan]
-])
 
     mjd_input, other = extract_fits_headers(image_file, logger)
     
@@ -2722,6 +2849,7 @@ def main():
     parser.add_argument('--retrain-model', action='store_true', help="Force retraining of the mask classifier.")
     parser.add_argument('--mask1_threshold', type=int, default=6000, help="Threshold for Mask 1.")
     parser.add_argument('--mask2_threshold', type=int, default=4000, help="Threshold for Mask 2.")
+    parser.add_argument('--type1_threshold', type=float, default=None, help="Optional Type-I threshold. If not provided, VQ1SAT and VQ2SAT are read from each FITS header.")
     parser.add_argument('--q4_q1_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q4 from Q1.")
     parser.add_argument('--q4_q2_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q4 from Q2.")
     parser.add_argument('--q3_q2_cfs', type=str, default="[0,None,None,None,None]", help="Correction coefficients for Q3 from Q2.")
