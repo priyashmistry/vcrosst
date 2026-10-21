@@ -19,6 +19,7 @@ The script includes two functions, `main()` and `process_file()`, which handle u
 | `--retrain-model` | Flag | `False` | Force retraining of the mask classifier. |
 | `--mask1_threshold` | Integer | `6000` | Threshold for mask from Q1. |
 | `--mask2_threshold` | Integer | `4000` | Threshold for mask from Q2. |
+| `--type1_threshold` | Integer | `None` | Optional Type-I threshold. If not provided, VQ1SAT and VQ2SAT are read from each FITS header. |
 | `--q4_q1_cfs` | String | `"[0,None,None,None,None]"` | Correction coefficients for Q4 from Q1. `None` can be changed to any number. |
 | `--q4_q2_cfs` | String | `"[0,None,None,None,None]"` | Correction coefficients for Q4 from Q2. |
 | `--q3_q2_cfs` | String | `"[0,None,None,None,None]"` | Correction coefficients for Q3 from Q2. |
